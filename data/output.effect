@@ -1,0 +1,18 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+sampler_state linearClamp {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+struct Vertex { float4 pos : POSITION; float2 uv : TEXCOORD0; };
+Vertex VS(Vertex v) {
+    Vertex o;
+    o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+    o.uv = v.uv;
+    return o;
+}
+float4 PS(Vertex v) : TARGET { return image.Sample(linearClamp, v.uv); }
+technique Draw {
+    pass { vertex_shader = VS(v); pixel_shader = PS(v); }
+}

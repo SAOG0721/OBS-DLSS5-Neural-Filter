@@ -1,0 +1,17 @@
+.deps/
+build/
+dist/
+tests/results/
+*.user
+*.pdb
+*.obj
+*.lib
+*.exp
+*.dll
+*.exe
+*.zip
+*.7z
+*.pyc
+__pycache__/
+.vs/
+CMakeUserPresets.json

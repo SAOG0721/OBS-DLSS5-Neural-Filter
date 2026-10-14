@@ -1,0 +1,2 @@
+#pragma once
+namespace neural { inline constexpr char shaderSource[] = R"neuralshader(@NEURAL_SHADER_SOURCE@)neuralshader"; }
