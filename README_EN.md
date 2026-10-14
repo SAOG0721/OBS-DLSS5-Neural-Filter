@@ -68,6 +68,6 @@ Use **Retry initialization** or **Copy diagnostics** in the filter when needed. 
 
 ## Source and license
 
-Build requirements and commands are in [BUILDING.md](docs/BUILDING.md). Releases include a matching source ZIP and SHA256 checksums.
+Clone this repository or use GitHub's source downloads to obtain the source code. Build requirements and commands are in [BUILDING.md](docs/BUILDING.md).
 
 The plugin source is licensed under **GNU GPL v3 (GPL-3.0-only)**; see [LICENSE](LICENSE). Component licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

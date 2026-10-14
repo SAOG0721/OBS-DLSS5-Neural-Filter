@@ -68,6 +68,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-OBS.ps1 -ObsRo
 
 ## 源码与许可证
 
-构建依赖和命令见 [BUILDING.md](docs/BUILDING.md)。Release 同时提供配套源码 ZIP 与 SHA256 校验文件。
+源码可直接克隆本仓库，或使用 GitHub 提供的源码下载。构建依赖和命令见 [BUILDING.md](docs/BUILDING.md)。
 
 插件源码采用 **GNU GPL v3（GPL-3.0-only）**，见 [LICENSE](LICENSE)。第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

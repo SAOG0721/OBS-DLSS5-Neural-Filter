@@ -30,8 +30,6 @@
 ### 下载内容
 
 - **Windows-x64.zip**：插件、DLSSNR 运行库、中英文资源、安装与回退工具。
-- **source.zip**：配套源码与构建说明。
-- **SHA256.txt**：下载文件校验值。
 
 插件源码采用 **GPL-3.0-only**。第三方组件许可随包附带。
 
@@ -67,7 +65,5 @@ The installer backs up the previous version. The included `INSTALL.md` covers ma
 ### Downloads
 
 - **Windows-x64.zip:** plugin, DLSSNR runtime, Chinese/English resources, installation and rollback tools.
-- **source.zip:** matching source code and build instructions.
-- **SHA256.txt:** archive checksums.
 
 The plugin source is licensed under **GPL-3.0-only**. Third-party licenses are included.
