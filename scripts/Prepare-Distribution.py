@@ -15,8 +15,12 @@ def digest(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', default='0.1.0')
+    parser.add_argument('--version', default='0.2.2')
     parser.add_argument('--runtime', type=Path)
+    parser.add_argument('--rtx50-runtime', type=Path,
+                        help='Optional NVIDIA original runtime included in the same main package')
+    parser.add_argument('--validation-report', type=Path,
+                        help='Validation summary paired with the current production DLL and default runtime')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', args.version):
         parser.error('Version must be a single directory name')
@@ -35,23 +39,35 @@ def main():
     runtime = args.runtime or build_package / 'bin/64bit/runtime/nvngx_dlssnr.dll'
     if not runtime.is_file():
         raise SystemExit('A bundled DLSSNR runtime is required for this distribution')
+    report = {}
+    if args.validation_report:
+        report = json.loads(args.validation_report.read_text(encoding='utf-8-sig'))
+        if report.get('PluginSHA256', '').upper() != digest(release):
+            raise SystemExit('Validation report is not paired with the current production DLL')
+        if report.get('RuntimeSHA256', '').upper() != digest(runtime):
+            raise SystemExit('Validation report is not paired with the selected default runtime')
+    if args.rtx50_runtime and not args.rtx50_runtime.is_file():
+        raise SystemExit('The optional RTX 50 runtime does not exist')
     stage.mkdir(parents=True)
     shutil.copytree(build_package, stage / 'obs-dlss5')
     target_runtime = stage / 'obs-dlss5/bin/64bit/runtime/nvngx_dlssnr.dll'
     target_runtime.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(runtime, target_runtime)
-    for name in ('Install.ps1', 'Install.cmd', 'Install-OBS.ps1', 'Install-OBS.cmd',
-                 'Deploy-SteamLocal.ps1', 'Restore.ps1', 'Delivery.ps1', 'Verify-Package.ps1'):
-        shutil.copy2(project / 'scripts' / name, stage / name)
-    shutil.copy2(project / 'docs/DISTRIBUTION-INSTALL.md', stage / 'INSTALL.md')
-    for name in ('README.md', 'README_EN.md', 'RELEASE-NOTES.md'):
-        shutil.copy2(project / name, stage / name)
-    (stage / 'docs').mkdir()
-    for name in ('BUILDING.md', 'DISTRIBUTION-INSTALL.md'):
-        shutil.copy2(project / 'docs' / name, stage / 'docs' / name)
-    shutil.copy2(project / 'THIRD_PARTY_NOTICES.md', stage / 'THIRD_PARTY_NOTICES.md')
-    shutil.copy2(project / 'LICENSE', stage / 'LICENSE')
-    shutil.copytree(project / 'licenses', stage / 'licenses')
+    runtime_options = []
+    if args.rtx50_runtime:
+        option = stage / 'obs-dlss5/bin/64bit/runtime/rtx50/nvngx_dlssnr.dll'
+        option.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.rtx50_runtime, option)
+        runtime_options.append({'File': 'bin/64bit/runtime/rtx50/nvngx_dlssnr.dll',
+                                'SHA256': digest(option), 'Bytes': option.stat().st_size,
+                                'Selection': 'Manual; NVIDIA original RTX 50 option'})
+    shutil.copy2(project / 'docs/DISTRIBUTION-INSTALL.md', stage / '安装说明.txt')
+    shutil.copy2(project / 'scripts/Install.cmd', stage / 'Install.cmd')
+    shutil.copy2(project / 'scripts/Uninstall.cmd', stage / 'Uninstall.cmd')
+    (stage / 'installer').mkdir(parents=True, exist_ok=True)
+    shutil.copy2(project / 'scripts/Manage-Install.ps1', stage / 'installer/Manage-Install.ps1')
+    for name in ('THIRD_PARTY_NOTICES.md', 'LICENSE'):
+        shutil.copy2(project / name, stage / 'obs-dlss5/data' / name)
     files = []
     for file in sorted((stage / 'obs-dlss5').rglob('*')):
         if file.is_file():
@@ -60,8 +76,10 @@ def main():
             files.append({'Relative': str(file.relative_to(stage / 'obs-dlss5')).replace('/', '\\'),
                           'Bytes': file.stat().st_size, 'SHA256': digest(file)})
     manifest = {
-        'Plugin': 'DLSS5 Neural Filter', 'Version': args.version, 'PluginVersion': '0.1.0',
-        'Revision': '20261010-completed-preview-stability',
+        'Plugin': 'DLSS5 Neural Filter', 'Version': args.version,
+        'PluginVersion': re.search(r'project\(Dlss5NeuralFilter VERSION ([0-9.]+)',
+                                  (project / 'CMakeLists.txt').read_text(encoding='utf-8')).group(1),
+        'Revision': 'ui-polish-and-magpie-0614-sync',
         'License': 'GPL-3.0-only',
         'SourceRepository': 'https://github.com/SAOG0721/OBS-DLSS5-Neural-Filter',
         'OBSVersionHardGate': False, 'HostVersionListIsAllowlist': False,
@@ -70,17 +88,14 @@ def main():
         'Runtime': {'File': 'bin/64bit/runtime/nvngx_dlssnr.dll',
                     'SHA256': digest(target_runtime), 'Bytes': target_runtime.stat().st_size,
                     'IdentityIsAllowlist': False},
-        'ValidatedHostVersions': ['32.2.2'], 'ValidatedGPU': 'RTX 5070 Ti / 616.92',
-        'Validation': {'VerifiedBuildDate': '2026-10-10', 'ContractTests': '8/8 passed',
-                       'ProductionLibobsNeuralAlphaAndRecovery': 'passed',
-                       'OffscreenDualPreviewPairs': 90,
-                       'CompleteNativeDialogAcceptance': False,
-                       'LongDurationAcceptance': False},
-        'PendingAcceptance': ['complete native filter-dialog UI/DPI combinations',
-                              'live game/camera sources', 'other GPUs',
-                              '30-minute OBS statistics', '2-hour sustained processing',
-                              'end-to-end latency', 'real-content AF artifacts'],
-        'InstallGuide': 'INSTALL.md', 'ReleaseNotes': 'RELEASE-NOTES.md', 'Files': files,
+        'RuntimeOptions': runtime_options,
+        'ValidatedHostVersions': report.get('ValidatedHostVersions', []),
+        'ValidatedGPU': report.get('ValidatedGPU', ''),
+        'Validation': report.get('Validation', {'Status': 'No paired validation report supplied'}),
+        'PendingAcceptance': report.get('PendingAcceptance', []),
+        'InstallGuide': '安装说明.txt',
+        'InstallerFiles': ['Install.cmd', 'Uninstall.cmd', 'installer/Manage-Install.ps1'],
+        'Files': files,
     }
     (stage / 'manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     print(json.dumps({'distribution': str(stage), 'pluginSha256': digest(plugin),

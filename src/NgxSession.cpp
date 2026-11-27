@@ -44,7 +44,7 @@ std::atomic<HMODULE> g_callerModule = nullptr;
 std::atomic<GetModuleFileNameWFn> g_originalGetModuleFileNameW = nullptr;
 std::mutex g_logMutex;
 std::mutex g_hookMutex;
-std::mutex g_runtimeExecutionMutex;
+std::timed_mutex g_runtimeExecutionMutex;
 struct CallerHook { HMODULE module=nullptr; std::uint32_t references=0; };
 std::map<void**,CallerHook> g_callerHooks;
 
@@ -531,7 +531,7 @@ struct NgxSession::Impl {
     ReleaseFeatureFn release=nullptr; ShutdownFn shutdown=nullptr;
     bool core=false, snippet=false;
 };
-NgxSession::NgxSession() : impl(std::make_unique<Impl>()) {}
+NgxSession::NgxSession() : execution(g_runtimeExecutionMutex),impl(std::make_unique<Impl>()) {}
 std::string resolveRuntimePath(const std::string& selection) {
     std::filesystem::path path;
     if (!selection.empty()) path=std::filesystem::path(wide(selection));
@@ -573,35 +573,42 @@ std::shared_ptr<NgxSession> NgxSession::acquire(IDXGIAdapter1* adapter,const std
     const auto data=applicationDataDirectory(); std::filesystem::create_directories(data);
     const auto directory=path.parent_path().wstring(); const wchar_t* paths[]{directory.c_str()};
     NVSDK_NGX_FeatureCommonInfo featureInfo{}; featureInfo.PathListInfo.Path=paths; featureInfo.PathListInfo.Length=1;
-    DWORD seh=0; auto result=callCoreInitSafely(data.c_str(),session->device.Get(),&featureInfo,&seh);
-    checkNgx("NGX core init",result,seh); session->impl->core=true;
-    session->impl->module=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!session->impl->module) throw std::runtime_error("Load selected runtime failed, Win32="+std::to_string(GetLastError()));
-    auto& impl=*session->impl;
-    const auto init=getExport<SnippetInitExtFn>(impl.module,"NVSDK_NGX_D3D12_Init_Ext");
-    impl.create=getExport<CreateFeatureFn>(impl.module,"NVSDK_NGX_D3D12_CreateFeature");
-    impl.evaluate=getExport<EvaluateFeatureFn>(impl.module,"NVSDK_NGX_D3D12_EvaluateFeature");
-    impl.release=getExport<ReleaseFeatureFn>(impl.module,"NVSDK_NGX_D3D12_ReleaseFeature");
-    impl.shutdown=getExport<ShutdownFn>(impl.module,"NVSDK_NGX_D3D12_Shutdown1");
-    if (!init || !impl.create || !impl.evaluate || !impl.release || !impl.shutdown)
-        throw std::runtime_error("Selected runtime lacks required Feature 18 exports");
-    if (!installSnippetCallerCompatibility(impl.module,&impl.hook))
-        throw std::runtime_error("Private runtime caller compatibility unavailable");
-    result=callSnippetInitSafely(init,data.c_str(),session->device.Get(),&seh);
-    checkNgx("Feature 18 Init_Ext",result,seh); impl.snippet=true;
+    // Keep the session outside this scope: a failed initialization must release
+    // the non-recursive gate before ~NgxSession performs its partial shutdown.
+    {
+        std::scoped_lock execution(g_runtimeExecutionMutex);
+        DWORD seh=0; auto result=callCoreInitSafely(data.c_str(),session->device.Get(),&featureInfo,&seh);
+        checkNgx("NGX core init",result,seh); session->impl->core=true;
+        session->impl->module=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (!session->impl->module) throw std::runtime_error("Load selected runtime failed, Win32="+std::to_string(GetLastError()));
+        auto& impl=*session->impl;
+        const auto init=getExport<SnippetInitExtFn>(impl.module,"NVSDK_NGX_D3D12_Init_Ext");
+        impl.create=getExport<CreateFeatureFn>(impl.module,"NVSDK_NGX_D3D12_CreateFeature");
+        impl.evaluate=getExport<EvaluateFeatureFn>(impl.module,"NVSDK_NGX_D3D12_EvaluateFeature");
+        impl.release=getExport<ReleaseFeatureFn>(impl.module,"NVSDK_NGX_D3D12_ReleaseFeature");
+        impl.shutdown=getExport<ShutdownFn>(impl.module,"NVSDK_NGX_D3D12_Shutdown1");
+        if (!init || !impl.create || !impl.evaluate || !impl.release || !impl.shutdown)
+            throw std::runtime_error("Selected runtime lacks required Feature 18 exports");
+        if (!installSnippetCallerCompatibility(impl.module,&impl.hook))
+            throw std::runtime_error("Private runtime caller compatibility unavailable");
+        result=callSnippetInitSafely(init,data.c_str(),session->device.Get(),&seh);
+        checkNgx("Feature 18 Init_Ext",result,seh); impl.snippet=true;
+    }
     sessions[key]=session; writeDiagnosticLog(session->identity); return session;
 }
 NgxSession::~NgxSession() {
+    std::scoped_lock lock(execution);
     DWORD seh=0;
     if (impl->snippet) callShutdownSafely(impl->shutdown,device.Get(),&seh);
     const bool restored=restoreSnippetCallerCompatibility(impl->hook);
     if (impl->module && restored) FreeLibrary(impl->module);
     if (impl->core) callShutdownSafely(&NVSDK_NGX_D3D12_Shutdown1,device.Get(),&seh);
 }
-void NgxSession::create(ID3D12GraphicsCommandList* list,Extent e,NVSDK_NGX_Parameter** parameters,NVSDK_NGX_Handle** handle) {
+void NgxSession::create(ID3D12GraphicsCommandList* list,Extent e,NVSDK_NGX_Parameter** parameters,NVSDK_NGX_Handle** handle,int modelPreset) {
+    if (modelPreset < 0 || modelPreset > 2) throw std::runtime_error("Invalid DLSSNR model preset");
     DWORD seh=0; auto result=callAllocateParametersSafely(parameters,&seh); checkNgx("Allocate NR parameters",result,seh);
     if (!*parameters) throw std::runtime_error("Allocate NR returned null parameters");
-    if (!setCreateParametersSafely(*parameters,e.width,e.height,1,&seh)) checkNgx("Set NR create parameters",NVSDK_NGX_Result_FAIL_PlatformError,seh);
+    if (!setCreateParametersSafely(*parameters,e.width,e.height,modelPreset,&seh)) checkNgx("Set NR create parameters",NVSDK_NGX_Result_FAIL_PlatformError,seh);
     result=callCreateFeatureSafely(impl->create,list,*parameters,handle,&seh); checkNgx("Create Feature 18",result,seh);
     if (!*handle) throw std::runtime_error("Create NR returned null feature");
 }

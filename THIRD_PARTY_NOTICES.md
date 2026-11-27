@@ -13,10 +13,13 @@ DLSS5 Neural Filter source code is licensed under **GPL-3.0-only**. The full lic
 
 ## Bundled runtime
 
-`nvngx_dlssnr.dll` is a separate NVIDIA runtime component with community modifications. Its licensing is separate from the GPL-3.0-only license for the plugin source.
+The DLSSNR DLLs are separate NVIDIA runtime components. Their licensing is separate from the GPL-3.0-only license for the plugin source. Both options retain the filenames supplied with Magpie Experimental 0.6.12. The [NVIDIA RTX SDK license](licenses/NVIDIA-RTX-SDK.txt) is included with the package.
 
-- File version: `310.8.0.0`
-- SHA256: `984BEE0F775C277D5829B8FD6775D53A7B0F75396C852B3AAF06A18375F81014`
-- This modified component reports Authenticode status `0x80096010` (bad digest), rather than an intact NVIDIA signature.
+| File | Version | Build | SHA256 |
+| --- | --- | --- | --- |
+| `runtime/nvngx_dlssnr.dll` | `310.9.16.0` | Community compatibility build, default | `A8A237A967469C455A84654932B513AB656FBAA1E0C44504B1E1BF0890F902B8` |
+| `runtime/rtx50/nvngx_dlssnr.dll` | `310.9.16.0` | NVIDIA original RTX 50 option | `2BC19BC09A7B89DD44F73E2AC0108FCC586E2154BDD0830F242F4F040E28789F` |
+
+The compatibility build has community modifications. The NVIDIA original retains its original signature.
 
 Checksums identify the supplied files for integrity checking. The plugin also accepts other compatible runtime builds.

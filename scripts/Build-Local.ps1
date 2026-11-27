@@ -7,7 +7,7 @@ param(
     [Parameter(Mandatory)][string]$NvOfSdkRoot,
     [Parameter(Mandatory)][string]$DxcPath,
     [string]$RuntimeDll='',
-    [string]$PackageVersion='0.1.0',
+    [string]$PackageVersion='0.2.2',
     [switch]$Package
 )
 $ErrorActionPreference='Stop'

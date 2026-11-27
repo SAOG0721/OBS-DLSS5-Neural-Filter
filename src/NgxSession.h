@@ -13,12 +13,14 @@ namespace neural {
 void writeDiagnosticLog(const std::string& message) noexcept;
 struct NgxSession {
     Microsoft::WRL::ComPtr<ID3D12Device> device;
-    std::timed_mutex execution;
+    // NGX documents its entry points as process-wide non-thread-safe, even
+    // when feature handles and runtime selections belong to different sessions.
+    std::timed_mutex& execution;
     std::string identity;
     static std::shared_ptr<NgxSession> acquire(IDXGIAdapter1* adapter, const std::string& runtime);
     ~NgxSession();
     void create(ID3D12GraphicsCommandList* list, Extent e, NVSDK_NGX_Parameter** parameters,
-                NVSDK_NGX_Handle** handle);
+                NVSDK_NGX_Handle** handle, int modelPreset = 1);
     void evaluate(ID3D12GraphicsCommandList* list, NVSDK_NGX_Parameter* parameters,
                   NVSDK_NGX_Handle* handle, ID3D12Resource* input, ID3D12Resource* output,
                   ID3D12Resource* motion, ID3D12Resource* depth, Extent e,

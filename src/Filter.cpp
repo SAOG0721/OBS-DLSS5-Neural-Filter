@@ -24,6 +24,66 @@ std::string escape(const std::string& message) {
     }
     return result;
 }
+struct SurfaceInfo {
+    bool available=false,texture=false;
+    int x=0,y=0,width=0,height=0;
+    gs_color_space source=GS_CS_SRGB,target=GS_CS_SRGB;
+};
+struct PropertyPhase {
+    int state=-1,percent=0,model=0,mode=0,interval=0;
+    Extent source{},inference{};
+    bool preparing=false,hasCompleted=false,copyNotice=false;
+    bool operator==(const PropertyPhase&) const = default;
+};
+bool updateDescription(obs_property_t* property,const std::string& description) {
+    if (api.obs_property_description) {
+        const auto* previous=api.obs_property_description(property);
+        if (previous && description==previous) return false;
+    }
+    api.obs_property_set_description(property,description.c_str());
+    return true;
+}
+void setInfoStyle(obs_property_t* property,obs_text_info_type type,bool wordWrap=true) {
+    if (!property) return;
+    if (api.obs_property_text_set_info_type) api.obs_property_text_set_info_type(property,type);
+    if (api.obs_property_text_set_info_word_wrap) api.obs_property_text_set_info_word_wrap(property,wordWrap);
+}
+bool updateInfoType(obs_property_t* property,obs_text_info_type type) {
+    if (!property || !api.obs_property_text_set_info_type) return false;
+    if (api.obs_property_text_info_type && api.obs_property_text_info_type(property)==type) return false;
+    api.obs_property_text_set_info_type(property,type);
+    return true;
+}
+obs_property_t* addInfoRow(obs_properties_t* props,const char* key,const char* labelKey,
+                           const std::string& content,obs_text_info_type type=OBS_TEXT_INFO_NORMAL) {
+    auto* prop=api.obs_properties_add_text(props,key,text(labelKey),OBS_TEXT_INFO);
+    api.obs_property_set_long_description(prop,content.c_str());
+    setInfoStyle(prop,type,true);
+    return prop;
+}
+bool updateInfoText(obs_property_t* property,const std::string& content) {
+    if (!property) return false;
+    if (api.obs_property_long_description) {
+        const auto* previous=api.obs_property_long_description(property);
+        if (previous && content==previous) return false;
+    }
+    api.obs_property_set_long_description(property,content.c_str());
+    return true;
+}
+void help(obs_properties_t* props,const char* key,const char* label) {
+    if (auto* property=api.obs_properties_get(props,key))
+        api.obs_property_set_long_description(property,text(label));
+}
+bool isRuntimeFound(const std::string& selection,std::string* resolvedPath=nullptr,std::string* errorText=nullptr) {
+    try {
+        const auto path=resolveRuntimePath(selection);
+        if (resolvedPath) *resolvedPath=path;
+        return std::filesystem::is_regular_file(std::filesystem::path(std::u8string(path.begin(),path.end())));
+    } catch (const std::exception& error) {
+        if (errorText) *errorText=error.what();
+        return false;
+    }
+}
 struct Filter {
     obs_source_t* source=nullptr;
     obs_weak_source_t* observed=nullptr;
@@ -44,8 +104,9 @@ struct Filter {
     std::atomic<bool> resetRequested=true,retryRequested=false;
     std::uint64_t generation=1,renderCount=0;
     std::uint64_t lastPropertyRefresh=0;
-    std::string surface;
-    std::string propertyPhase;
+    std::atomic<std::uint64_t> lastSettingsChange=0,copyNoticeUntilNs=0;
+    SurfaceInfo surface;
+    PropertyPhase propertyPhase;
     bool wasBypass=false;
     gs_color_space lastColor=GS_CS_SRGB;
     std::int64_t mediaTime=-1;
@@ -77,14 +138,14 @@ struct Filter {
             api.signal_handler_connect(signals,event,inputChanged,this);
         ++inputRevision; resetRequested=true;
     }
-    void report(const std::string& state,bool failure=false) {
-        const auto d=backend->diagnostics();
+    void report(const std::string& state,const Diagnostics& d,bool failure=false) {
         std::scoped_lock lock(diagnosticMutex);
         if (firstFailure.empty() && (failure || !d.error.empty())) firstFailure=d.firstError.empty() ? state : d.firstError;
         if (!d.error.empty() && d.error != diagnostic.error)
             api.blog(LOG_WARNING,"[DLSS5 Neural Filter] %s",d.report().c_str());
         reason=state; diagnostic=d;
     }
+    void report(const std::string& state,bool failure=false) { report(state,backend->diagnostics(),failure); }
     void destroyGraphics() {
         backend.reset();
         if (result) api.gs_texture_destroy(result);
@@ -98,12 +159,18 @@ void update(void* value,obs_data_t* data) {
     auto number=[&](const char* key) { return static_cast<float>(api.obs_data_get_double(data,key)); };
     s.mix=number("mix"); s.strength=number("strength"); s.chroma=number("chroma"); s.lightness=number("lightness");
     s.darken=number("darken"); s.brighten=number("brighten"); s.hue=number("hue");
+    s.midtone=number("midtone"); s.chromaProtection=number("chroma_protection");
     s.darkProtect=number("dark_protect"); s.brightProtect=number("bright_protect"); s.compression=number("compression");
     s.low=number("low"); s.high=number("high"); s.afStrength=number("af_strength"); s.responseMs=number("response_ms");
     s.passes=static_cast<int>(api.obs_data_get_int(data,"passes")); s.view=static_cast<int>(api.obs_data_get_int(data,"view"));
     s.debug=static_cast<int>(api.obs_data_get_int(data,"debug")); s.percent=static_cast<int>(api.obs_data_get_int(data,"percent"));
     s.flow=static_cast<int>(api.obs_data_get_int(data,"flow")); s.amdQuality=static_cast<int>(api.obs_data_get_int(data,"amd_quality"));
     s.nvQuality=static_cast<int>(api.obs_data_get_int(data,"nv_quality")); s.af=static_cast<int>(api.obs_data_get_int(data,"af"));
+    s.modelPreset=static_cast<int>(api.obs_data_get_int(data,"model_preset"));
+    s.resolutionControl=static_cast<int>(api.obs_data_get_int(data,"resolution_control"));
+    s.processingMode=static_cast<int>(api.obs_data_get_int(data,"processing_mode"));
+    s.updateInterval=static_cast<int>(api.obs_data_get_int(data,"update_interval"));
+    s.residualTransfer=static_cast<int>(api.obs_data_get_int(data,"residual_transfer"));
     s.advanced=api.obs_data_get_bool(data,"advanced"); s.scaling=api.obs_data_get_bool(data,"scaling");
     s.runtime=api.obs_data_get_string(data,"runtime");
     for (int i=0;i<3;++i) {
@@ -116,19 +183,22 @@ void update(void* value,obs_data_t* data) {
     }
     s.sanitize();
     std::scoped_lock lock(f.settingsMutex);
-    if (s.runtime != f.settings.runtime) f.retryRequested=true;
+    if (f.settings!=s) f.lastSettingsChange=monotonicNs();
     f.settings=std::move(s);
 }
 void defaults(obs_data_t* data) {
-    for (const char* key : {"mix","strength","chroma","lightness","darken","brighten","low","high","af_strength"})
+    for (const char* key : {"mix","strength","chroma","lightness","darken","brighten","midtone","low","high","af_strength"})
         api.obs_data_set_default_double(data,key,1);
-    for (const char* key : {"hue","dark_protect","bright_protect","compression"})
+    for (const char* key : {"hue","chroma_protection","dark_protect","bright_protect","compression"})
         api.obs_data_set_default_double(data,key,0);
     api.obs_data_set_default_double(data,"response_ms",80);
     api.obs_data_set_default_int(data,"schemaVersion",Settings::schemaVersion);
+    api.obs_data_set_default_int(data,"ui_page",0); api.obs_data_set_default_int(data,"edit_pass",1);
     api.obs_data_set_default_int(data,"passes",1); api.obs_data_set_default_int(data,"percent",100);
+    api.obs_data_set_default_int(data,"model_preset",1); api.obs_data_set_default_int(data,"resolution_control",1);
+    api.obs_data_set_default_int(data,"update_interval",2);
     api.obs_data_set_default_int(data,"amd_quality",1); api.obs_data_set_default_int(data,"nv_quality",2);
-    for (const char* key : {"view","debug","flow","af"}) api.obs_data_set_default_int(data,key,0);
+    for (const char* key : {"view","debug","flow","af","processing_mode","residual_transfer"}) api.obs_data_set_default_int(data,key,0);
     api.obs_data_set_default_bool(data,"advanced",false); api.obs_data_set_default_bool(data,"scaling",false);
     api.obs_data_set_default_string(data,"runtime","");
     for (int i=1;i<=3;++i) {
@@ -159,8 +229,14 @@ void tick(void* value,float seconds) {
     auto& f=*static_cast<Filter*>(value); ++f.tick;
     const auto now=monotonicNs();
     const auto d=f.backend->diagnostics();
-    const auto phase=f.wasBypass ? "bypass" : !d.error.empty() ? "error" : d.state=="degraded" ? "degraded" : d.outputAvailable ? "processing" : "initializing";
-    if (api.obs_source_update_properties && f.propertyPhase!=phase && now-f.lastPropertyRefresh>500000000ull) {
+    const PropertyPhase phase{f.wasBypass ? 0 : !d.error.empty() ? 1 : d.state=="degraded" ? 2 : d.outputAvailable ? 3 : 4,
+        d.currentPercent,d.modelPreset,d.processingMode,d.updateInterval,d.source,d.inference,
+        d.preparingResources,d.completedFrames>0,now<f.copyNoticeUntilNs.load()};
+    // Information-only reloads replace the native form. Let an active drag
+    // finish, while processing/error transitions keep their existing refresh.
+    const bool refreshInformation=now-f.lastSettingsChange.load()>200000000ull;
+    if (api.obs_source_update_properties && f.propertyPhase!=phase && now-f.lastPropertyRefresh>500000000ull &&
+        (refreshInformation || phase.state!=f.propertyPhase.state)) {
         f.propertyPhase=phase; f.lastPropertyRefresh=now; api.obs_source_update_properties(f.source);
     }
     auto* parent=api.obs_filter_get_parent(f.source);
@@ -176,20 +252,96 @@ void tick(void* value,float seconds) {
 void hidden(void* value) { static_cast<Filter*>(value)->resetRequested=true; }
 const char* name(void*) { return "DLSS5 Neural Filter"; }
 bool visibility(obs_properties_t* props,obs_property_t*,obs_data_t* settings) {
-    const auto count=api.obs_data_get_int(settings,"passes");
-    const bool advanced=api.obs_data_get_bool(settings,"advanced");
-    api.obs_property_set_visible(api.obs_properties_get(props,"pass2"),count>=2);
-    api.obs_property_set_visible(api.obs_properties_get(props,"pass3"),count>=3);
-    api.obs_property_set_visible(api.obs_properties_get(props,"protection_controls"),advanced);
-    api.obs_property_set_visible(api.obs_properties_get(props,"debug"),advanced);
+    bool changed=false;
+    const auto show=[&](const char* key,bool visible) {
+        auto* property=api.obs_properties_get(props,key);
+        if (!property) return;
+        if (!api.obs_property_visible || api.obs_property_visible(property)!=visible) {
+            api.obs_property_set_visible(property,visible); changed=true;
+        }
+    };
+    const auto disableItem=[&](obs_property_t* property,size_t idx,bool disabled) {
+        if (!property || !api.obs_property_list_item_disable) return;
+        if (!api.obs_property_list_item_disabled || api.obs_property_list_item_disabled(property,idx)!=disabled) {
+            api.obs_property_list_item_disable(property,idx,disabled); changed=true;
+        }
+    };
+    const int page=std::clamp<int>(static_cast<int>(api.obs_data_get_int(settings,"ui_page")),0,4);
+    const int count=std::clamp<int>(static_cast<int>(api.obs_data_get_int(settings,"passes")),1,3);
+    const int requestedPass=std::clamp<int>(static_cast<int>(api.obs_data_get_int(settings,"edit_pass")),1,3);
+    const int activePass=std::min(requestedPass,count);
+    if (auto* editPassProp=api.obs_properties_get(props,"edit_pass")) {
+        disableItem(editPassProp,1,count<2);
+        disableItem(editPassProp,2,count<3);
+    }
+
+    const auto view=api.obs_data_get_int(settings,"view");
+    const bool correctionView=view==0 || view==2;
+    const auto debug=std::clamp<long long>(api.obs_data_get_int(settings,"debug"),0,7);
+    show("diagnostic_status",debug!=0);
+    const char* debugNames[]={"DebugOff","DebugDelta","DebugBright","DebugDark","DebugProtect","DebugCompression","DebugGamut","DebugLab"};
+    const auto diagnostic=correctionView ? std::string(text("ActiveDiagnostic"))+text(debugNames[debug]) : text("DebugInactiveHelp");
+    changed=updateInfoText(api.obs_properties_get(props,"diagnostic_status"),escape(diagnostic)) || changed;
+
+    // Page 0: Quick
+    show("view",page==0);
+    show("model_preset",page==0);
+    show("mix",page==0);
+    show("strength",page==0);
+
+    // Page 1: NR passes (single-pass editor + Pass 1 core shared on Quick)
+    show("passes",page==1);
+    show("edit_pass",page==1 && count>1);
+    for (int i=1;i<=3;++i) {
+        const auto prefix="p"+std::to_string(i)+"_";
+        const bool selected=(page==1 && i<=count && activePass==i);
+        const bool coreVisible=selected || (page==0 && i==1);
+        for (const char* suffix : {"style","intensity","tone","structure"})
+            show((prefix+suffix).c_str(),coreVisible);
+        for (const char* suffix : {"skin","mask","ui"})
+            show((prefix+suffix).c_str(),selected);
+    }
+
+    // Page 2: Color & protection
+    for (const char* key : {"chroma","lightness","midtone","darken","brighten",
+                            "chroma_protection","hue","dark_protect","bright_protect","compression","low","high"})
+        show(key,page==2);
+
+    // Page 3: Performance & anti-flicker
+    const bool alternating=api.obs_data_get_int(settings,"processing_mode")==1;
     const auto flow=api.obs_data_get_int(settings,"flow");
-    api.obs_property_set_visible(api.obs_properties_get(props,"amd_quality"),flow==1);
-    api.obs_property_set_visible(api.obs_properties_get(props,"nv_quality"),flow==2);
-    const bool af=api.obs_data_get_int(settings,"af")!=0;
-    api.obs_property_set_visible(api.obs_properties_get(props,"af_strength"),af);
-    api.obs_property_set_visible(api.obs_properties_get(props,"response_ms"),af);
-    api.obs_property_set_visible(api.obs_properties_get(props,"percent"),api.obs_data_get_bool(settings,"scaling"));
-    return true;
+    const auto afMode=api.obs_data_get_int(settings,"af");
+    const bool af=afMode!=0;
+    const bool scaling=api.obs_data_get_bool(settings,"scaling");
+    const bool adaptive=api.obs_data_get_int(settings,"resolution_control")==0;
+    show("processing_mode",page==3);
+    show("update_interval",page==3 && alternating);
+    show("residual_transfer",page==3 && alternating);
+    show("residual_fallback",page==3 && alternating && flow==0 && api.obs_data_get_int(settings,"residual_transfer")==1);
+    show("scaling",page==3);
+    show("resolution_control",page==3 && scaling);
+    show("percent",page==3 && scaling && !adaptive);
+    show("current_percent",page==3 && scaling && adaptive);
+    show("flow",page==3);
+    show("amd_quality",page==3 && flow==1);
+    show("nv_quality",page==3 && flow==2);
+    show("af",page==3);
+    show("af_strength",page==3 && af);
+    show("response_ms",page==3 && af);
+    show("af_flow_note",page==3 && flow==0 && afMode>=2);
+
+    // Page 4: Runtime & diagnostics
+    show("debug",page==4 && correctionView);
+    show("performance_status",page==4);
+    show("performance_detail",page==4);
+    show("resource_status",page==4);
+    show("refresh_stats",page==4);
+    show("runtime",page==4);
+    show("runtime_status",page==4);
+    show("reset",page==4);
+    show("retry",page==4);
+    show("copy",page==4);
+    return changed;
 }
 void slider(obs_properties_t* p,const char* key,const char* label,float max=2,float step=.05f) {
     auto* property=api.obs_properties_add_float_slider(p,key,text(label),0,max,step);
@@ -201,14 +353,18 @@ void list(obs_properties_t* p,const char* key,const char* label,std::initializer
     int i=first; for (auto option : options) api.obs_property_list_add_int(property,text(option),i++);
 }
 void passProperties(obs_properties_t* props,int i) {
-    auto* group=api.obs_properties_create(); const auto prefix="p"+std::to_string(i)+"_";
-    list(group,(prefix+"style").c_str(),"Style",{"Style0","Style1","Style2"});
-    api.obs_property_set_long_description(api.obs_properties_get(group,(prefix+"style").c_str()),text("StyleHelp"));
-    for (const auto& [key,label] : {std::pair{"intensity","Intensity"},{"tone","Tone"},{"structure","Structure"},{"skin","Skin"}})
-        slider(group,(prefix+key).c_str(),label);
-    api.obs_properties_add_bool(group,(prefix+"mask").c_str(),text("AutoMask"));
-    api.obs_properties_add_bool(group,(prefix+"ui").c_str(),text("UiCorrection"));
-    api.obs_properties_add_group(props,("pass"+std::to_string(i)).c_str(),text(("Pass"+std::to_string(i)).c_str()),OBS_GROUP_NORMAL,group);
+    const auto prefix="p"+std::to_string(i)+"_";
+    list(props,(prefix+"style").c_str(),"Style",{"Style0","Style1","Style2"});
+    for (const auto& [key,label,helpKey] : {
+        std::tuple{"intensity","Intensity","IntensityHelp"},
+        std::tuple{"tone","Tone","ToneHelp"},
+        std::tuple{"structure","Structure","StructureHelp"},
+        std::tuple{"skin","Skin","SkinHelp"}}) {
+        slider(props,(prefix+key).c_str(),label);
+        help(props,(prefix+key).c_str(),helpKey);
+    }
+    api.obs_properties_add_bool(props,(prefix+"mask").c_str(),text("AutoMask"));
+    api.obs_properties_add_bool(props,(prefix+"ui").c_str(),text("UiCorrection"));
 }
 bool resetButton(obs_properties_t*,obs_property_t*,void* data) {
     if (!data) return false;
@@ -218,25 +374,34 @@ bool retryButton(obs_properties_t*,obs_property_t*,void* data) {
     if (!data) return false;
     static_cast<Filter*>(data)->retryRequested=true; return true;
 }
-std::string runtimeStatus(const std::string& selection) {
-    try {
-        const auto path=resolveRuntimePath(selection);
-        const bool found=std::filesystem::is_regular_file(std::filesystem::path(std::u8string(path.begin(),path.end())));
-        return escape(std::string(text(selection.empty() ? "RuntimeAuto" : "RuntimeManual"))+" · "+
-            text(found ? "RuntimeFound" : "RuntimeMissing"))+"<br>"+escape(path);
-    } catch (const std::exception& error) { return escape(error.what()); }
+bool refreshStatsButton(obs_properties_t*,obs_property_t*,void*) { return true; }
+std::string runtimeStatus(const std::string& selection,bool* foundOut=nullptr) {
+    std::string path,error;
+    const bool found=isRuntimeFound(selection,&path,&error);
+    if (foundOut) *foundOut=found;
+    if (!error.empty()) return escape(error);
+    return escape(std::string(text(selection.empty() ? "RuntimeAuto" : "RuntimeManual"))+" · "+
+        text(found ? "RuntimeFound" : "RuntimeMissing"))+"<br>"+escape(path);
 }
-bool runtimeChanged(obs_properties_t* props,obs_property_t*,obs_data_t* data) {
-    const auto status=runtimeStatus(api.obs_data_get_string(data,"runtime"));
-    api.obs_property_set_description(api.obs_properties_get(props,"runtime_status"),status.c_str());
-    return true;
+bool runtimeChanged(obs_properties_t* props,obs_property_t* prop,obs_data_t* data) {
+    bool found=false;
+    const auto status=runtimeStatus(api.obs_data_get_string(data,"runtime"),&found);
+    auto* statusProp=api.obs_properties_get(props,"runtime_status");
+    bool changed=updateInfoText(statusProp,status);
+    changed=updateInfoType(statusProp,found ? OBS_TEXT_INFO_NORMAL : OBS_TEXT_INFO_ERROR) || changed;
+    changed=visibility(props,prop,data) || changed;
+    return changed;
 }
 bool copyButton(obs_properties_t*,obs_property_t*,void* data) {
     if (!data) return false;
     auto& f=*static_cast<Filter*>(data); std::string message;
-    { std::scoped_lock lock(f.diagnosticMutex); message="plugin=" NEURAL_PLUGIN_VERSION "\nOBS="+
+    { std::scoped_lock lock(f.diagnosticMutex);
+      std::ostringstream surface;
+      if (f.surface.available) surface << "viewport=" << f.surface.x << ',' << f.surface.y << ',' << f.surface.width << 'x' << f.surface.height
+          << "; target=" << (f.surface.texture ? "texture" : "display") << "; sourceSpace=" << f.surface.source << "; targetSpace=" << f.surface.target;
+      message="plugin=" NEURAL_PLUGIN_VERSION "\nOBS="+
         std::string(api.obs_get_version_string ? api.obs_get_version_string() : "unreported")+
-        "\nstatus="+f.reason+"\nfilterFirstFailure="+f.firstFailure+"\n"+f.surface+"\n"+f.diagnostic.report(); }
+        "\nstatus="+f.reason+"\nfilterFirstFailure="+f.firstFailure+"\n"+surface.str()+"\n"+f.diagnostic.report(); }
     const auto n=MultiByteToWideChar(CP_UTF8,0,message.data(),static_cast<int>(message.size()),nullptr,0);
     if (n<=0 || !OpenClipboard(nullptr)) { f.report(text("CopyFailed"),true); return true; }
     bool copied=false;
@@ -252,87 +417,154 @@ bool copyButton(obs_properties_t*,obs_property_t*,void* data) {
     }
     CloseClipboard();
     if (!copied) { f.report(text("CopyFailed"),true); return true; }
-    return false;
+    f.copyNoticeUntilNs=monotonicNs()+4000000000ull;
+    return true;
 }
 obs_properties_t* properties(void* value) {
     auto* props=api.obs_properties_create();
-    std::string status;
+    std::string statusText;
+    obs_text_info_type statusType=OBS_TEXT_INFO_NORMAL;
+    Diagnostics snapshot;
+    std::string runtimeSelection;
+    bool hasSnapshot=false;
+    int savedDebug=0;
     if (value) {
         auto& f=*static_cast<Filter*>(value);
-        std::scoped_lock lock(f.diagnosticMutex); status=escape(std::string(text("Status"))+": "+f.reason);
-    } else status=text("Status");
-    // Keep the outer form free of labelled fields so the status uses its full
-    // width. A long description on info creates another label/value pair.
-    status+="<br>"+escape(text("StatusHelp"));
-    api.obs_properties_add_text(props,"status",status.c_str(),OBS_TEXT_INFO);
-    auto* compare=api.obs_properties_create();
-    list(compare,"view","View",{"Normal","Original","Split","Difference"});
-    list(compare,"debug","Debug",{"DebugOff","DebugDelta","DebugBright","DebugDark","DebugProtect","DebugCompression","DebugGamut","DebugLab"});
-    api.obs_property_set_long_description(api.obs_properties_get(compare,"debug"),text("DebugHelp"));
-    api.obs_properties_add_group(props,"comparison_controls",text("ComparisonControls"),OBS_GROUP_NORMAL,compare);
-    auto* overall=api.obs_properties_create();
-    slider(overall,"mix","Mix",1,.01f); slider(overall,"strength","Strength");
-    api.obs_property_set_long_description(api.obs_properties_get(overall,"mix"),text("MixHelp"));
-    api.obs_property_set_long_description(api.obs_properties_get(overall,"strength"),text("StrengthHelp"));
-    api.obs_properties_add_group(props,"overall_controls",text("OverallControls"),OBS_GROUP_NORMAL,overall);
-    auto* model=api.obs_properties_create();
-    auto* p=api.obs_properties_add_int_slider(model,"passes",text("PassCount"),1,3,1);
-    api.obs_property_set_modified_callback(p,visibility);
-    api.obs_properties_add_group(props,"model_controls",text("ModelControls"),OBS_GROUP_NORMAL,model);
-    for (int i=1;i<=3;++i) passProperties(props,i);
-    auto* color=api.obs_properties_create();
-    slider(color,"chroma","Chroma"); slider(color,"lightness","Lightness");
-    slider(color,"darken","Darken"); slider(color,"brighten","Brighten");
-    api.obs_properties_add_group(props,"color_controls",text("ColorControls"),OBS_GROUP_NORMAL,color);
-    p=api.obs_properties_add_bool(props,"advanced",text("Advanced"));
-    api.obs_property_set_modified_callback(p,visibility);
-    auto* advanced=api.obs_properties_create();
-    slider(advanced,"hue","Hue",1); slider(advanced,"dark_protect","DarkProtect",1);
-    slider(advanced,"bright_protect","BrightProtect",1); slider(advanced,"compression","Compression",1);
-    slider(advanced,"low","Low"); slider(advanced,"high","High");
-    api.obs_properties_add_group(props,"protection_controls",text("ProtectionControls"),OBS_GROUP_NORMAL,advanced);
-    auto* motion=api.obs_properties_create();
-    list(motion,"flow","Flow",{"FlowNone","FlowAmd","FlowNv"});
-    api.obs_property_set_modified_callback(api.obs_properties_get(motion,"flow"),visibility);
-    list(motion,"amd_quality","AmdQuality",{"Performance","Quality"});
-    list(motion,"nv_quality","NvQuality",{"Performance","Balanced","Quality","HighQuality","HighestQuality"},1);
-    list(motion,"af","Af",{"AfOff","AfStatic","AfFlow","AfFlowPlus","AfLow"});
-    api.obs_property_set_modified_callback(api.obs_properties_get(motion,"af"),visibility);
-    api.obs_property_set_long_description(api.obs_properties_get(motion,"flow"),text("FlowHelp"));
-    slider(motion,"af_strength","AfStrength",1);
-    api.obs_property_set_long_description(api.obs_properties_get(motion,"af_strength"),text("FractionHelp"));
-    api.obs_properties_add_float_slider(motion,"response_ms",text("Response"),10,500,5);
-    api.obs_properties_add_group(props,"motion_controls",text("MotionControls"),OBS_GROUP_NORMAL,motion);
-    auto* performance=api.obs_properties_create();
-    p=api.obs_properties_add_bool(performance,"scaling",text("Scaling"));
-    api.obs_property_set_modified_callback(p,visibility);
-    api.obs_properties_add_int_slider(performance,"percent",text("Percent"),25,100,1);
-    std::string metrics=text("PerformanceWaiting");
-    if (value) {
-        auto& f=*static_cast<Filter*>(value); Diagnostics d;
-        { std::scoped_lock lock(f.diagnosticMutex); d=f.diagnostic; }
-        if (d.source.width) {
-            std::ostringstream s; s << d.source.width << "×" << d.source.height << " → " << d.inference.width << "×" << d.inference.height;
-            if (d.completedFrames) s << std::fixed << std::setprecision(2) << "<br>GPU NR " << d.gpuNrMs << " ms · D3D12 " << d.gpuTotalMs
-                << " ms · " << text("OutputAge") << ' ' << d.outputAgeMs << " ms";
-            s << "<br>" << text("CompletedFrames") << ' ' << d.completedFrames << " · " << text("BusyCount") << ' ' << d.busy;
-            metrics=s.str();
+        std::string reason;
+        {
+            std::scoped_lock lock(f.diagnosticMutex);
+            snapshot=f.diagnostic; reason=f.reason; hasSnapshot=true;
         }
+        {
+            std::scoped_lock lock(f.settingsMutex);
+            runtimeSelection=f.settings.runtime;
+            savedDebug=f.settings.debug;
+        }
+        statusText=escape(reason);
+        if (hasSnapshot && snapshot.source.width) {
+            std::ostringstream summary;
+            summary << " · " << snapshot.source.width << "×" << snapshot.source.height
+                    << " → " << snapshot.inference.width << "×" << snapshot.inference.height;
+            if (snapshot.currentPercent!=100) summary << " (" << snapshot.currentPercent << "%)";
+            summary << " · " << text(snapshot.modelPreset==0 ? "PresetAutoShort" : snapshot.modelPreset==2 ? "PresetCC" : "PresetHT");
+            statusText+=escape(summary.str());
+        }
+        if (savedDebug!=0) statusText+=" · "+escape(text("DiagnosticsActive"));
+        if (monotonicNs()<f.copyNoticeUntilNs.load()) statusText+=" · "+escape(text("Copied"));
+        const bool errorState=!snapshot.error.empty() || reason==text("UnsupportedGraphics") ||
+            reason==text("ShaderError") || reason==text("UnsupportedSize") || reason==text("CopyFailed");
+        const bool warningState=f.wasBypass || snapshot.state=="busy" || snapshot.state=="degraded" ||
+            snapshot.preparingResources || reason==text("HdrBypass");
+        statusType=errorState ? OBS_TEXT_INFO_ERROR : warningState ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL;
+    } else statusText=escape(text("PerformanceWaiting"));
+    addInfoRow(props,"status","Status",statusText,statusType);
+
+    list(props,"ui_page","Page",{"PageQuick","PagePasses","PageColor","PagePerformance","PageDiagnostics"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"ui_page"),visibility);
+    addInfoRow(props,"diagnostic_status","DiagnosticNote","",OBS_TEXT_INFO_WARNING);
+
+    // Page 0: Quick
+    list(props,"view","View",{"Normal","Original","Split","Difference"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"view"),visibility);
+    list(props,"model_preset","ModelPreset",{"PresetAuto","PresetHT","PresetCC"});
+    help(props,"model_preset","ModelHelp");
+    slider(props,"mix","Mix",1,.01f); help(props,"mix","MixHelp");
+    slider(props,"strength","Strength"); help(props,"strength","StrengthHelp");
+
+    // Page 1: NR passes (single-pass editor + Pass 1 core controls shared on Page 0)
+    list(props,"passes","PassCount",{"PassCount1","PassCount2","PassCount3"},1);
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"passes"),visibility);
+    list(props,"edit_pass","EditPass",{"EditPass1","EditPass2","EditPass3"},1);
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"edit_pass"),visibility);
+    for (int i=1;i<=3;++i) passProperties(props,i);
+
+    // Page 2: Color & protection
+    slider(props,"chroma","Chroma"); help(props,"chroma","ChromaHelp");
+    slider(props,"lightness","Lightness"); help(props,"lightness","LightnessHelp");
+    slider(props,"midtone","Midtone"); help(props,"midtone","MidtoneHelp");
+    slider(props,"darken","Darken"); help(props,"darken","DarkenHelp");
+    slider(props,"brighten","Brighten"); help(props,"brighten","BrightenHelp");
+    slider(props,"chroma_protection","ChromaProtection",1); help(props,"chroma_protection","ChromaProtectionHelp");
+    slider(props,"hue","Hue",1); help(props,"hue","HueHelp");
+    slider(props,"dark_protect","DarkProtect",1); help(props,"dark_protect","DarkProtectHelp");
+    slider(props,"bright_protect","BrightProtect",1); help(props,"bright_protect","BrightProtectHelp");
+    slider(props,"compression","Compression",1); help(props,"compression","CompressionHelp");
+    slider(props,"low","Low"); help(props,"low","LowHelp");
+    slider(props,"high","High"); help(props,"high","HighHelp");
+
+    // Page 3: Performance & anti-flicker
+    list(props,"processing_mode","ProcessingMode",{"EveryFrame","Alternating"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"processing_mode"),visibility);
+    help(props,"processing_mode","ProcessingHelp");
+    list(props,"update_interval","UpdateInterval",{"Interval2","Interval3","Interval4"},2);
+    list(props,"residual_transfer","ResidualTransfer",{"ResidualInPlace","ResidualReproject"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"residual_transfer"),visibility);
+    help(props,"residual_transfer","ResidualHelp");
+    addInfoRow(props,"residual_fallback","FallbackNote",escape(text("ResidualFallback")),OBS_TEXT_INFO_WARNING);
+    auto* p=api.obs_properties_add_bool(props,"scaling",text("Scaling"));
+    api.obs_property_set_modified_callback(p,visibility);
+    list(props,"resolution_control","ResolutionControl",{"ResolutionAdaptive","ResolutionManual"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"resolution_control"),visibility);
+    help(props,"resolution_control","ResolutionHelp");
+    p=api.obs_properties_add_int_slider(props,"percent",text("Percent"),25,100,1);
+    if (api.obs_property_int_set_suffix) api.obs_property_int_set_suffix(p,"%");
+    api.obs_property_set_long_description(p,text("PercentHelp"));
+
+    std::string metrics=escape(text("PerformanceWaiting"));
+    std::string resourceState=escape(text("PerformanceWaiting"));
+    std::string details=escape(text("DiagnosticSnapshotHelp"));
+    std::string currentPercent=escape(text("PerformanceWaiting"));
+    if (hasSnapshot && snapshot.source.width) {
+        const auto& d=snapshot;
+        resourceState=escape(text(d.preparingResources ? "ResourcesPreparing" : "ResourcesReady"));
+        std::ostringstream s; s << d.source.width << "×" << d.source.height << " → " << d.inference.width << "×" << d.inference.height;
+        metrics=s.str();
+        currentPercent=std::to_string(d.currentPercent)+"%";
+        if (!d.adaptiveReason.empty()) currentPercent+=" ("+escape(d.adaptiveReason)+")";
+        s.str(""); s.clear();
+        s << text("RequestedModel") << ' ' << text(d.modelPreset==0 ? "PresetAuto" : d.modelPreset==2 ? "PresetCC" : "PresetHT");
+        s << " · " << text(d.processingMode==1 ? "Alternating" : "EveryFrame");
+        if (d.processingMode==1) s << " · " << text("UpdateInterval") << ' ' << d.updateInterval;
+        if (d.completedFrames) s << std::fixed << std::setprecision(2) << "<br>GPU NR " << d.gpuNrMs << " ms · D3D12 " << d.gpuTotalMs
+            << " ms · " << text("OutputAge") << ' ' << d.outputAgeMs << " ms";
+        s << "<br>" << text("CompletedFrames") << ' ' << d.completedFrames << " · " << text("BusyCount") << ' ' << d.busy;
+        s << "<br>" << text("FullUpdates") << ' ' << d.fullUpdates << " · " << text("LightweightComposites") << ' ' << d.lightweightComposites
+            << " · " << text("ResidualAge") << ' ' << d.residualAge;
+        details=s.str();
     }
-    api.obs_properties_add_text(performance,"performance_status",metrics.c_str(),OBS_TEXT_INFO);
-    api.obs_properties_add_group(props,"performance_controls",text("PerformanceControls"),OBS_GROUP_NORMAL,performance);
-    auto* runtimeControls=api.obs_properties_create();
-    p=api.obs_properties_add_path(runtimeControls,"runtime",text("Runtime"),OBS_PATH_FILE,"DLSSNR DLL (*.dll)",nullptr);
+    addInfoRow(props,"current_percent","CurrentPercent",currentPercent);
+    list(props,"flow","Flow",{"FlowNone","FlowAmd","FlowNv"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"flow"),visibility);
+    help(props,"flow","FlowHelp");
+    list(props,"amd_quality","AmdQuality",{"Performance","Quality"});
+    list(props,"nv_quality","NvQuality",{"Performance","Balanced","Quality","HighQuality","HighestQuality"},1);
+    list(props,"af","Af",{"AfOff","AfStatic","AfFlow","AfFlowPlus","AfLow"});
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"af"),visibility);
+    slider(props,"af_strength","AfStrength",1); help(props,"af_strength","FractionHelp");
+    p=api.obs_properties_add_float_slider(props,"response_ms",text("Response"),10,500,5);
+    if (api.obs_property_float_set_suffix) api.obs_property_float_set_suffix(p," ms");
+    api.obs_property_set_long_description(p,text("ResponseHelp"));
+    addInfoRow(props,"af_flow_note","FlowNote",escape(text("AfFlowFallback")),OBS_TEXT_INFO_WARNING);
+
+    // Page 4: Runtime & diagnostics
+    list(props,"debug","Debug",{"DebugOff","DebugDelta","DebugBright","DebugDark","DebugProtect","DebugCompression","DebugGamut","DebugLab"});
+    help(props,"debug","DebugHelp");
+    api.obs_property_set_modified_callback(api.obs_properties_get(props,"debug"),visibility);
+    addInfoRow(props,"performance_status","Dimensions",metrics);
+    addInfoRow(props,"performance_detail","DiagnosticSnapshot",details);
+    addInfoRow(props,"resource_status","ResourceStatus",resourceState,
+        hasSnapshot && snapshot.preparingResources ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
+    api.obs_properties_add_button2(props,"refresh_stats",text("RefreshStats"),refreshStatsButton,value);
+    p=api.obs_properties_add_path(props,"runtime",text("Runtime"),OBS_PATH_FILE,"DLSSNR DLL (*.dll)",nullptr);
     api.obs_property_set_long_description(p,text("RuntimeHelp"));
     api.obs_property_set_modified_callback(p,runtimeChanged);
-    std::string selection;
-    if (value) { auto& f=*static_cast<Filter*>(value); std::scoped_lock lock(f.settingsMutex); selection=f.settings.runtime; }
-    const auto runtimeInfo=runtimeStatus(selection);
-    api.obs_properties_add_text(runtimeControls,"runtime_status",runtimeInfo.c_str(),OBS_TEXT_INFO);
-    api.obs_properties_add_button2(runtimeControls,"reset",text("Reset"),resetButton,value);
-    api.obs_properties_add_button2(runtimeControls,"retry",text("Retry"),retryButton,value);
-    api.obs_properties_add_button2(runtimeControls,"copy",text("Copy"),copyButton,value);
-    api.obs_properties_add_group(props,"runtime_controls",text("RuntimeControls"),OBS_GROUP_NORMAL,runtimeControls);
+    bool runtimeFound=false;
+    const auto runtimeInfo=runtimeStatus(runtimeSelection,&runtimeFound);
+    addInfoRow(props,"runtime_status","RuntimeStatus",runtimeInfo,
+        runtimeFound ? OBS_TEXT_INFO_NORMAL : OBS_TEXT_INFO_ERROR);
+    api.obs_properties_add_button2(props,"reset",text("Reset"),resetButton,value);
+    api.obs_properties_add_button2(props,"retry",text("Retry"),retryButton,value);
+    api.obs_properties_add_button2(props,"copy",text("Copy"),copyButton,value);
     return props;
 }
 void renderImpl(void* value,gs_effect_t*) {
@@ -342,9 +574,12 @@ void renderImpl(void* value,gs_effect_t*) {
     auto* target=api.obs_filter_get_target(f.source);
     auto* parent=api.obs_filter_get_parent(f.source);
     if (!target || !parent) { f.resetRequested=true; f.report("waiting for source"); api.obs_source_skip_video_filter(f.source); return; }
+    settings.targetFps=api.videoTargetFps(parent);
     f.observe(parent);
     if (settings.bypass()) {
-        f.wasBypass=true; f.resetRequested=true; f.report(text("Bypass"));
+        f.wasBypass=true; f.resetRequested=true;
+        const char* bypassKey=settings.view==1 ? "BypassView" : settings.mix==0 ? "BypassMix" : "BypassStrength";
+        f.report(text(bypassKey));
         api.obs_source_skip_video_filter(f.source); return;
     }
     if (f.wasBypass) { f.resetRequested=true; f.wasBypass=false; }
@@ -356,10 +591,8 @@ void renderImpl(void* value,gs_effect_t*) {
     const auto canvas=api.gs_get_color_space();
     if (api.gs_get_viewport) {
         gs_rect viewport{}; api.gs_get_viewport(&viewport);
-        std::ostringstream s; s << "viewport=" << viewport.x << ',' << viewport.y << ',' << viewport.cx << 'x' << viewport.cy
-            << "; target=" << (api.gs_get_render_target && api.gs_get_render_target() ? "texture" : "display")
-            << "; sourceSpace=" << color << "; targetSpace=" << canvas;
-        std::scoped_lock lock(f.diagnosticMutex); f.surface=s.str();
+        std::scoped_lock lock(f.diagnosticMutex);
+        f.surface={true,api.gs_get_render_target && api.gs_get_render_target(),viewport.x,viewport.y,viewport.cx,viewport.cy,color,canvas};
     }
     if ((color!=GS_CS_SRGB && color!=GS_CS_SRGB_16F) || (canvas!=GS_CS_SRGB && canvas!=GS_CS_SRGB_16F)) {
         f.resetRequested=true; f.report(text("HdrBypass")); api.obs_source_skip_video_filter(f.source); return;
@@ -410,7 +643,7 @@ void renderImpl(void* value,gs_effect_t*) {
     if (!processed) {
         const auto d=f.backend->diagnostics();
         const auto state=d.state=="busy" ? text("Busy") : d.state=="degraded" ? text("Degraded") : text("Initializing");
-        f.report(d.error.empty() ? state : d.error); api.obs_source_skip_video_filter(f.source); return;
+        f.report(d.error.empty() ? state : d.error,d); api.obs_source_skip_video_filter(f.source); return;
     }
     const bool srgb=api.gs_framebuffer_srgb_enabled();
     api.gs_enable_framebuffer_srgb(true);
@@ -419,9 +652,9 @@ void renderImpl(void* value,gs_effect_t*) {
     while (api.gs_effect_loop(f.effect,"Draw")) api.gs_draw_sprite(f.result,0,size.width,size.height);
     api.gs_blend_state_pop(); api.gs_enable_framebuffer_srgb(srgb);
     const auto displayed=f.backend->diagnostics();
-    f.report(text(displayed.state=="busy" ? "Busy" : "Processing"));
+    f.report(text(displayed.state=="busy" ? "Busy" : "Processing"),displayed);
     if (++f.renderCount % 300 == 1) {
-        const auto report=f.backend->diagnostics().report();
+        const auto report=displayed.report();
         api.blog(LOG_INFO,"[DLSS5 Neural Filter] %s",report.c_str());
     }
 }

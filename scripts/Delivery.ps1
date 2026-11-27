@@ -22,6 +22,19 @@ function Join-NeuralOwnedPath([string]$Root,[string]$Relative) {
     $resolved
 }
 function Get-NeuralHash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+function Test-NeuralObsRunningForTarget([string]$TargetRoot, [bool]$TouchesProgramData = $false) {
+    $procs = @(Get-Process -Name obs64 -ErrorAction SilentlyContinue)
+    if (!$procs.Count) { return $false }
+    if ($TouchesProgramData -or !$TargetRoot) { return $true }
+    $prefix = (Resolve-NeuralPath $TargetRoot).TrimEnd('\', '/') + '\'
+    foreach ($p in $procs) {
+        $exePath = $null
+        try { $exePath = $p.Path } catch {}
+        if (!$exePath) { return $true }
+        if ((Resolve-NeuralPath $exePath).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
 function Assert-NeuralRuntime([string]$Path) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Runtime file not found: $Path" }
     $bytes=[IO.File]::ReadAllBytes($Path)

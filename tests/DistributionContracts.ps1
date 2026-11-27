@@ -1,71 +1,115 @@
-# SPDX-License-Identifier: GPL-3.0-only
+﻿# SPDX-License-Identifier: GPL-3.0-only
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$PackageRoot)
+param(
+    [Parameter(Mandatory)][string]$PackageRoot,
+    [string]$ZipPath=''
+)
 $ErrorActionPreference='Stop'
 $project=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$resolvedPkg=[IO.Path]::GetFullPath($PackageRoot)
+$manifest=Get-Content -LiteralPath (Join-Path $resolvedPkg 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if (!$ZipPath) {
+    $ZipPath=Join-Path $project ("dist\DLSS5-Neural-Filter-$($manifest.Version)-Windows-x64.zip")
+}
+if (!(Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "Release ZIP not found: $ZipPath" }
+
+$verification=& (Join-Path $project 'scripts\Verify-Package.ps1') -PackageRoot $resolvedPkg
+if ($verification.State -ne 'Verified') { throw 'Package verification failed' }
+
 $fixture=Join-Path $project ('tests\results\distribution-'+[Guid]::NewGuid().ToString('N'))
+$extracted=Join-Path $fixture 'extracted'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $extracted)
+
+foreach ($expectedTop in @('Install.cmd', 'Uninstall.cmd', 'installer\Manage-Install.ps1', '安装说明.txt', 'obs-plugins\64bit\obs-dlss5.dll', 'obs-plugins\64bit\runtime\nvngx_dlssnr.dll')) {
+    if (!(Test-Path -LiteralPath (Join-Path $extracted $expectedTop) -PathType Leaf)) {
+        throw "Extracted release ZIP is missing expected entry: $expectedTop"
+    }
+}
+
 $target=Join-Path $fixture 'OBS Application'
 $backup=Join-Path $fixture 'backups'
+$legacyDir=Join-Path $fixture 'legacy-programdata\obs-dlss5'
 $exe=Join-Path $target 'bin\64bit\obs64.exe'
 $oldPlugin=Join-Path $target 'obs-plugins\64bit\obs-dlss5.dll'
-foreach ($file in @($exe,$oldPlugin)) {
+$legacyDll=Join-Path $legacyDir 'bin\64bit\obs-dlss5.dll'
+foreach ($file in @($exe, $oldPlugin, $legacyDll)) {
     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($file)) -Force | Out-Null
-    [IO.File]::WriteAllText($file,'existing application fixture')
+    [IO.File]::WriteAllText($file, 'existing application fixture')
 }
 $oldHash=(Get-FileHash -LiteralPath $oldPlugin -Algorithm SHA256).Hash
 $sentinel=Join-Path $target 'user-note.txt'
-[IO.File]::WriteAllText($sentinel,'preserve unrelated files')
+[IO.File]::WriteAllText($sentinel, 'preserve unrelated files')
 $unrelated=Join-Path $target 'unrelated-empty-directory'
 New-Item -ItemType Directory -Path $unrelated | Out-Null
-$verification=& (Join-Path $PackageRoot 'Verify-Package.ps1') -PackageRoot $PackageRoot
-if ($verification.State -ne 'Verified') { throw 'Package verification failed' }
-$runner=if ($PSVersionTable.PSVersion.Major -ge 6) { Join-Path $PSHOME 'pwsh.exe' } else { Join-Path $PSHOME 'powershell.exe' }
-# Use -File without PackageRoot, exactly as the double-click entry points do.
-& $runner -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PackageRoot 'Verify-Package.ps1') | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Native -File verification/default package root failed' }
-& $runner -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PackageRoot 'Install.ps1') -Destination (Join-Path $fixture 'default-preview') -BackupRoot (Join-Path $fixture 'default-backup') | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Native -File standard preview/default package root failed' }
-& $runner -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PackageRoot 'Install-OBS.ps1') -ObsRoot $target -BackupRoot (Join-Path $fixture 'default-backup') | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Native -File application preview/default package root failed' }
-if ((Test-Path -LiteralPath (Join-Path $fixture 'default-preview')) -or
-    (Test-Path -LiteralPath (Join-Path $fixture 'default-backup'))) { throw 'Native default preview wrote files' }
-$preview=& (Join-Path $PackageRoot 'Install-OBS.ps1') -ObsRoot $target -PackageRoot $PackageRoot -BackupRoot $backup
-if ((Get-FileHash -LiteralPath $oldPlugin -Algorithm SHA256).Hash -ne $oldHash -or (Test-Path -LiteralPath $backup)) {
-    throw 'Application-local preview modified files'
+
+$manageScript=Join-Path $extracted 'installer\Manage-Install.ps1'
+
+# 1. Preview must not touch disk or create backups
+$previewJson=& $manageScript -Mode Install -ObsRoot $target -BackupRoot $backup -LegacyProgramDataDir $legacyDir -NonInteractive
+$preview=$previewJson | ConvertFrom-Json
+if ($preview.Mode -ne 'Preview' -or $preview.Files.Count -ne $manifest.Files.Count) {
+    throw 'Installer preview output mismatch'
 }
-$installed=& (Join-Path $PackageRoot 'Install-OBS.ps1') -ObsRoot $target -PackageRoot $PackageRoot -BackupRoot $backup -Apply
-if ($installed.State -ne 'Installed') { throw 'Application-local installation failed' }
+if ((Get-FileHash -LiteralPath $oldPlugin -Algorithm SHA256).Hash -ne $oldHash -or (Test-Path -LiteralPath $backup)) {
+    throw 'Preview modified target or created a backup'
+}
+
+# 2. Apply install using obs64.exe path directly (verifies smart parent resolution + legacy ProgramData migration)
+$installed=& $manageScript -Mode Install -ObsRoot $exe -BackupRoot $backup -LegacyProgramDataDir $legacyDir -CleanLegacyProgramData -NonInteractive -Apply
+if ($installed.State -ne 'Installed' -or $installed.FileCount -ne $manifest.Files.Count) {
+    throw 'One-click installer apply failed'
+}
+if (Test-Path -LiteralPath $legacyDir) { throw 'Legacy ProgramData directory was not moved out' }
+if (!$installed.LegacyMoved -or !(Test-Path -LiteralPath (Join-Path $installed.LegacyMoved 'bin\64bit\obs-dlss5.dll'))) {
+    throw 'Legacy ProgramData backup is missing'
+}
 $receipt=Get-Content -LiteralPath $installed.Receipt -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($entry in $receipt.Entries) {
-    if ((Get-FileHash -LiteralPath (Join-Path $target $entry.Relative) -Algorithm SHA256).Hash -ne $entry.InstalledSHA256) {
-        throw 'Application-local installed hash differs from receipt'
+    $file=Join-Path $target $entry.Relative
+    if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $entry.InstalledSHA256) {
+        throw "Installed hash mismatch: $($entry.Relative)"
     }
 }
-$restored=& (Join-Path $receipt.BackupDirectory 'Restore.ps1') -Receipt $installed.Receipt -Apply
+
+# 3. Restore via Restore.ps1
+$restored=& (Join-Path $project 'scripts\Restore.ps1') -Receipt $installed.Receipt -Apply
 if ($restored.State -ne 'Restored' -or (Get-FileHash -LiteralPath $oldPlugin -Algorithm SHA256).Hash -ne $oldHash) {
-    throw 'Standalone rollback did not restore prior plugin'
+    throw 'Rollback did not restore prior plugin'
 }
 if (!(Test-Path -LiteralPath $sentinel) -or !(Test-Path -LiteralPath $unrelated) -or
-    @(Get-ChildItem -LiteralPath $target -Recurse -File).Count -ne 3) { throw 'Rollback changed unrelated application contents' }
-# Corrupt only an isolated package copy; previews must reject it without writes.
-$badPackage=Join-Path $fixture 'damaged-package'
-Copy-Item -LiteralPath $PackageRoot -Destination $badPackage -Recurse
-$locale=Join-Path $badPackage 'obs-dlss5\data\locale\en-US.ini'
-[IO.File]::AppendAllText($locale,"`ncorrupt fixture`n")
-foreach ($layout in @('global','application')) {
-    $rejected=$false
-    try {
-        if ($layout -eq 'global') {
-            & (Join-Path $badPackage 'Install.ps1') -PackageRoot $badPackage -Destination (Join-Path $fixture 'not-installed') -BackupRoot (Join-Path $fixture 'not-backed-up') | Out-Null
-        } else {
-            & (Join-Path $badPackage 'Install-OBS.ps1') -PackageRoot $badPackage -ObsRoot $target -BackupRoot (Join-Path $fixture 'not-backed-up') | Out-Null
-        }
-    } catch {
-        if ($_.Exception.Message -notlike '*Package integrity failure*') { throw }
-        $rejected=$true
-    }
-    if (!$rejected) { throw 'Corrupt payload was accepted' }
+    @(Get-ChildItem -LiteralPath $target -Recurse -File).Count -ne 3) {
+    throw 'Rollback altered unrelated OBS contents'
 }
-if (Test-Path -LiteralPath (Join-Path $fixture 'not-backed-up')) { throw 'Integrity failure created a backup' }
-[pscustomobject]@{State='Passed';PowerShell=$PSVersionTable.PSVersion.ToString();
-    Coverage='verify; application-local preview/install/standalone rollback; unrelated preservation; damaged package rejection';Fixture=$fixture}
+
+# 4. Re-install clean, then test Uninstall leaves unrelated files and dirs untouched
+$reinstalled=& $manageScript -Mode Install -ObsRoot $target -BackupRoot $backup -LegacyProgramDataDir (Join-Path $fixture 'no-legacy') -NonInteractive -Apply
+if ($reinstalled.State -ne 'Installed') { throw 'Re-install failed' }
+$uninstalled=& $manageScript -Mode Uninstall -ObsRoot $target -LegacyProgramDataDir (Join-Path $fixture 'no-legacy') -NonInteractive -Apply
+if ($uninstalled.State -ne 'Uninstalled' -or $uninstalled.RemovedFiles -ne $manifest.Files.Count) {
+    throw 'Uninstall did not remove expected plugin files'
+}
+if (Test-Path -LiteralPath $oldPlugin) { throw 'Plugin DLL remained after uninstall' }
+if (Test-Path -LiteralPath (Join-Path $target 'data\obs-plugins\obs-dlss5')) { throw 'Plugin data directory remained after uninstall' }
+if (!(Test-Path -LiteralPath $exe) -or !(Test-Path -LiteralPath $sentinel) -or !(Test-Path -LiteralPath $unrelated)) {
+    throw 'Uninstall removed unrelated OBS files or directories'
+}
+
+# 5. Damaged package rejection
+$badExtracted=Join-Path $fixture 'damaged-extracted'
+Copy-Item -LiteralPath $extracted -Destination $badExtracted -Recurse
+Remove-Item -LiteralPath (Join-Path $badExtracted 'obs-plugins\64bit\obs-dlss5.dll') -Force
+$rejected=$false
+try {
+    & (Join-Path $badExtracted 'installer\Manage-Install.ps1') -Mode Install -ObsRoot $target -BackupRoot $backup -NonInteractive | Out-Null
+} catch {
+    $rejected=$true
+}
+if (!$rejected) { throw 'Damaged extracted package was accepted' }
+
+[pscustomobject]@{
+    State='Passed'
+    PowerShell=$PSVersionTable.PSVersion.ToString()
+    Coverage='zip extraction; preview; obs64 parent resolution; install; legacy ProgramData cleanup; rollback; clean uninstall; damaged package rejection'
+    Fixture=$fixture
+}

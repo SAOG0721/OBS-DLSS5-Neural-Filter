@@ -24,7 +24,10 @@ struct Diagnostics {
     std::uint64_t renderRequests=0, completedFrames=0, displays=0, busy=0, droppedCandidates=0;
     std::uint64_t submittedFence=0, completedFence=0, displayedFrame=0;
     double outputAgeMs=0, initializationMs=0, shaderCompileMs=0, featureCreateMs=0;
-    bool outputAvailable=false;
+    bool outputAvailable=false,preparingResources=false;
+    int modelPreset=1,processingMode=0,updateInterval=2,currentPercent=100;
+    std::uint64_t fullUpdates=0,lightweightComposites=0,residualAge=0;
+    std::string adaptiveReason;
     std::string report() const;
 };
 enum class BackendTestMode { Neural, Identity, ControlledDelta };
@@ -32,6 +35,7 @@ enum class BackendScheduling { Immediate, CompletedFrames };
 class GpuBackend {
 public:
     struct Impl;
+    struct Preparation;
     // OBS uses the default 3 ms. Offline readback probes may use a longer
     // budget so scheduler jitter does not masquerade as a pixel-contract fault.
     explicit GpuBackend(BackendTestMode mode = BackendTestMode::Neural, unsigned waitBudgetMs = 3,
@@ -52,6 +56,10 @@ public:
     void setTestDelay(unsigned milliseconds);
 private:
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<Impl> warming_;
+    std::unique_ptr<Impl> recovery_;
+    std::shared_ptr<Preparation> preparation_;
+    Diagnostics warmBaseline_;
     // Preserve the last healthy device/runtime across failed selections and
     // size rebuilds. Feature handles and textures remain per backend instance.
     std::shared_ptr<NgxSession> sessionAnchor_;

@@ -2,6 +2,8 @@
 #include "ObsApi.h"
 #include "GpuBackend.h"
 #include <Windows.h>
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -30,6 +32,22 @@ bool ObsApi::bind(Resolver resolver,std::string& reason) {
 #undef BIND
     return reason.empty();
 }
+float ObsApi::videoTargetFps(const obs_source_t* owner) const {
+    obs_video_info info{};
+    // A source's owning canvas can have a different rate from the main canvas.
+    // The getter increments the canvas reference, so use it only with release.
+    if (owner && obs_source_get_canvas && obs_canvas_get_video_info && obs_canvas_release) {
+        if (auto* canvas=obs_source_get_canvas(owner)) {
+            const bool valid=obs_canvas_get_video_info(canvas,&info);
+            obs_canvas_release(canvas);
+            if (valid && info.fps_num && info.fps_den)
+                return static_cast<float>(info.fps_num)/info.fps_den;
+        }
+    }
+    if (obs_get_video_info && obs_get_video_info(&info) && info.fps_num && info.fps_den)
+        return static_cast<float>(info.fps_num)/info.fps_den;
+    return 60;
+}
 std::string dataDirectory() {
     if (module && api.obs_get_module_data_path) return api.obs_get_module_data_path(module);
     HMODULE current=nullptr;
@@ -46,9 +64,18 @@ void loadLocale(const char* locale) {
     requestedLocale=locale ? locale : "en-US";
     if (!api.obs_get_module_data_path && !module) return;
     strings.clear();
-    const auto name=requestedLocale.starts_with("zh") ? "zh-CN" : "en-US";
+    std::string lower=requestedLocale;
+    std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const bool traditional=lower.starts_with("zh-tw") || lower.starts_with("zh_tw") ||
+        lower.starts_with("zh-hk") || lower.starts_with("zh_hk") ||
+        lower.starts_with("zh-mo") || lower.starts_with("zh_mo") ||
+        lower.starts_with("zh-hant") || lower.starts_with("zh_hant");
     const auto directory=dataDirectory();
-    std::ifstream file(std::filesystem::path(std::u8string(directory.begin(),directory.end()))/"locale"/(std::string(name)+".ini"));
+    const auto openLocale=[&](const char* name) {
+        return std::ifstream(std::filesystem::path(std::u8string(directory.begin(),directory.end()))/"locale"/(std::string(name)+".ini"));
+    };
+    auto file=openLocale(traditional ? "zh-TW" : lower.starts_with("zh") ? "zh-CN" : "en-US");
+    if (!file && traditional) file=openLocale("zh-CN");
     std::string line;
     while (std::getline(file,line)) {
         if (!line.empty() && line.back()=='\r') line.pop_back();

@@ -62,7 +62,9 @@ int main() {
                 require(backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,frame==0),backend.diagnostics().error);
                 const auto value=sample(); if (frame>=10) values.push_back(value);
                 const auto commits=backend.diagnostics().temporalCommits;
-                require(backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,false),"Repeated temporal draw");
+                const bool repeated=backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,false);
+                require(repeated,
+                    "Repeated temporal draw; AF="+std::to_string(mode)+"; frame="+std::to_string(frame)+"; "+backend.diagnostics().report());
                 require(backend.diagnostics().temporalCommits==commits,"Duplicate draw advanced AF history");
                 sample();
                 ++key.cycle; now+=16666667;

@@ -3,6 +3,7 @@
 #include <DirectXPackedVector.h>
 #include <wrl/client.h>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -50,8 +51,13 @@ int main() {
         auto untilReady=[&] {
             const auto deadline=Clock::now()+std::chrono::seconds(3);
             while (Clock::now()<deadline) {
-                if (backend.process(device.Get(),input.Get(),output.Get(),settings,key,now(),false)) return;
-                require(backend.diagnostics().error.empty(),backend.diagnostics().report()); Sleep(2); ++key.cycle;
+                const bool displayed=backend.process(device.Get(),input.Get(),output.Get(),settings,key,now(),false);
+                const auto diagnostic=backend.diagnostics();
+                // The first capture timestamp predates cold device/shader
+                // initialization. Establish a recent completed observation
+                // before testing a separate 100 ms private-queue overload.
+                if (displayed && diagnostic.outputAgeMs<100) return;
+                require(diagnostic.error.empty(),diagnostic.report()); Sleep(2); ++key.cycle;
             }
             throw std::runtime_error("Completed output did not become available: "+backend.diagnostics().report());
         };
@@ -64,7 +70,10 @@ int main() {
         const auto retained=sample();
         require(Clock::now()-start<std::chrono::milliseconds(80),"OBS context waited for current private inference");
         for(int repeat=0;repeat<8;++repeat) {
-            require(backend.process(device.Get(),input.Get(),output.Get(),settings,key,now(),false),"Busy pipeline returned original instead of ready output");
+            const bool displayed=backend.process(device.Get(),input.Get(),output.Get(),settings,key,now(),false);
+            require(displayed,"Busy pipeline returned original instead of ready output; cycle="+std::to_string(key.cycle)+
+                "; repeat="+std::to_string(repeat)+"; elapsedMs="+
+                std::to_string(std::chrono::duration<double,std::milli>(Clock::now()-start).count())+"; "+backend.diagnostics().report());
             require(backend.diagnostics().displayedFrame==before.displayedFrame,"Two views chose different results in one cycle");
             require(backend.diagnostics().temporalCommits==before.temporalCommits,"Busy draw advanced temporal history");
             require(backend.diagnostics().resets==before.resets,"Busy draw reset temporal history");
@@ -84,6 +93,32 @@ int main() {
         }
         require(changed,"Same-cycle pixel change reused stale output indefinitely");
         require(backend.diagnostics().inputComparisons>0,"Exact input verification was not performed");
+        // Keep changing an outlet while a same-key pixel comparison is pending.
+        // The comparison belongs to the captured input, not the slider value
+        // that happened to be selected when it was submitted.
+        const auto dragStart=Clock::now();
+        const auto beforeDrag=backend.diagnostics();
+        const float beforeDragPixel=sample(); bool dragChangedOutput=false;
+        for (int step=0;step<12;++step) {
+            // Asynchronous verification may skip intermediate mouse values.
+            // Keep consumed values distinct instead of locking a two-value
+            // toggle to the verification/submission cadence and aging a cache hit.
+            settings.midtone=.2f+step*.14f;
+            const bool displayed=backend.process(device.Get(),input.Get(),output.Get(),settings,key,now(),false);
+            require(displayed,"Continuous same-key outlet update lost the completed output; step="+std::to_string(step)+
+                "; elapsedMs="+std::to_string(std::chrono::duration<double,std::milli>(Clock::now()-dragStart).count())+
+                "; beforeDragPixel="+std::to_string(beforeDragPixel)+"; before drag: "+beforeDrag.report()+
+                "; after drag: "+backend.diagnostics().report());
+            const float dragPixel=sample();
+            dragChangedOutput=dragChangedOutput || std::abs(dragPixel-beforeDragPixel)>.0005f;
+            Sleep(2);
+        }
+        const auto afterDrag=backend.diagnostics();
+        require(afterDrag.inputComparisons>beforeDrag.inputComparisons,"Outlet drag bypassed input pixel verification");
+        require(afterDrag.completedFrames>beforeDrag.completedFrames && dragChangedOutput,
+            "Changing outlet values discarded pixel validation and starved composition: "+afterDrag.report());
+        require(afterDrag.evaluations==beforeDrag.evaluations && afterDrag.temporalCommits==beforeDrag.temporalCommits,
+            "Same-key outlet drag advanced NR or temporal observations");
         std::cout << "Realtime completed-result display, two-view consistency, bounded busy handling, AF retention, recovery, alpha and same-cycle pixel invalidation passed\n"
                   << backend.diagnostics().report() << '\n';
         return 0;

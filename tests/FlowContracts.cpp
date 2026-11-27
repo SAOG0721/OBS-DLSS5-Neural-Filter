@@ -56,7 +56,9 @@ int main(int argc,char** argv) {
             context->UpdateSubresource(input.Get(),0,nullptr,pixels.data(),extent.width*8,0);
         };
         Settings settings; settings.flow=method; settings.amdQuality=quality; settings.nvQuality=quality; settings.af=2;
-        GpuBackend backend(BackendTestMode::ControlledDelta);
+        // This checks vector content, not the realtime submission budget.
+        // A concurrent game can delay the tiny duplicate-input comparison.
+        GpuBackend backend(BackendTestMode::ControlledDelta,3000);
         upload(0,0);
         std::uint64_t now=1000000000; FrameKey key{1,0,1,extent};
         require(backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,true),backend.diagnostics().error);
@@ -84,7 +86,8 @@ int main(int argc,char** argv) {
         std::cout << "downward8px meanMotion=" << y[0] << ',' << y[1] << '\n';
         require(std::abs(y[1]+8)<2 && std::abs(y[0])<2,"Vertical direction or pixel-unit contract failed");
         const auto evaluations=backend.diagnostics().evaluations;
-        require(backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,false),"Repeat flow input failed");
+        const bool repeated=backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,false);
+        require(repeated,"Repeat flow input failed: "+backend.diagnostics().report());
         require(backend.diagnostics().evaluations==evaluations,"Repeat flow input advanced NR");
         backend.inspectMotion();
         if (method==1) {

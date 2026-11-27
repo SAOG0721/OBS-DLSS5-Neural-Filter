@@ -23,7 +23,8 @@ if (!$Apply) {
     return
 }
 if (!$Force -and @($actions | Where-Object Modified).Count) { throw 'Installed files changed after installation; review preview before using -Force' }
-if (Get-Process obs64 -ErrorAction SilentlyContinue) { throw 'Close OBS before restoring plugin files' }
+$touchesProgramData = $root.StartsWith((Resolve-NeuralPath $env:ProgramData).TrimEnd('\', '/') + '\', [StringComparison]::OrdinalIgnoreCase)
+if (Test-NeuralObsRunningForTarget $root $touchesProgramData) { throw 'Close OBS before restoring plugin files' }
 foreach ($action in $actions) {
     if ($action.Action -eq 'RestoreOriginal') {
         New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($action.Target)) -Force | Out-Null

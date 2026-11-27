@@ -29,7 +29,12 @@ extern "C" {
  X(gs_enable_blending) X(gs_clear) X(gs_ortho) X(gs_get_color_space) \
  X(gs_framebuffer_srgb_enabled) X(gs_enable_framebuffer_srgb)
 #define NEURAL_OBS_OPTIONAL(X) X(obs_source_get_color_space) X(obs_get_video_frame_time) X(obs_get_version_string) X(obs_get_module_data_path) X(obs_source_media_get_time) \
- X(obs_property_float_set_suffix) X(obs_source_update_properties) X(gs_get_viewport) X(gs_get_render_target)
+ X(obs_get_video_info) X(obs_source_get_canvas) X(obs_canvas_get_video_info) X(obs_canvas_release) \
+ X(obs_property_visible) X(obs_property_description) X(obs_property_long_description) X(obs_property_text_info_type) \
+ X(obs_property_int_set_suffix) X(obs_property_float_set_suffix) \
+ X(obs_property_list_item_disable) X(obs_property_list_item_disabled) \
+ X(obs_property_text_set_info_type) X(obs_property_text_set_info_word_wrap) \
+ X(obs_source_update_properties) X(gs_get_viewport) X(gs_get_render_target)
 namespace neural {
 struct ObsApi {
 #define DECLARE(name) decltype(&::name) name=nullptr;
@@ -39,6 +44,7 @@ struct ObsApi {
     bool bind(std::string& reason);
     using Resolver=void*(*)(const char*);
     bool bind(Resolver resolver,std::string& reason);
+    float videoTargetFps(const obs_source_t* owner) const;
 };
 extern ObsApi api;
 const char* text(const char* key);

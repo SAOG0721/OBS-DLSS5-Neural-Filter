@@ -1,7 +1,13 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install.ps1" -Apply
-set "result=%errorlevel%"
-if not "%result%"=="0" echo Installation failed. Read INSTALL.md and close OBS before trying again.
+set "SCRIPT=%~dp0installer\Manage-Install.ps1"
+if not exist "%SCRIPT%" set "SCRIPT=%~dp0Manage-Install.ps1"
+if "%~1"=="" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Mode Install -Apply
+) else (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Mode Install -ObsRoot "%~1" -Apply
+)
+set "RESULT=%errorlevel%"
+echo.
 pause
-exit /b %result%
+exit /b %RESULT%

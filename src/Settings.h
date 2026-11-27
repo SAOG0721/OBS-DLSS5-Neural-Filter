@@ -15,13 +15,17 @@ struct PassSettings {
     bool operator==(const PassSettings&) const = default;
 };
 struct Settings {
-    static constexpr int schemaVersion = 1;
+    static constexpr int schemaVersion = 2;
     std::array<PassSettings, 3> pass{};
     int passes = 1, view = 0, debug = 0;
     float mix = 1, strength = 1, chroma = 1, lightness = 1, darken = 1, brighten = 1;
+    float midtone = 1, chromaProtection = 0;
     float hue = 0, darkProtect = 0, brightProtect = 0, compression = 0, low = 1, high = 1;
     bool advanced = false, scaling = false;
     int percent = 100, flow = 0, amdQuality = 1, nvQuality = 2, af = 0;
+    int modelPreset = 1, resolutionControl = 1, processingMode = 0, updateInterval = 2, residualTransfer = 0;
+    // Supplied by the OBS render context; never persisted as a source setting.
+    float targetFps = 60;
     float afStrength = 1, responseMs = 80;
     std::string runtime;
     bool operator==(const Settings&) const = default;
@@ -30,6 +34,12 @@ struct Settings {
             v = std::isfinite(v) ? std::clamp(v, 0.f, hi) : fallback;
         };
         passes = std::clamp(passes, 1, 3);
+        modelPreset = std::clamp(modelPreset, 0, 2);
+        resolutionControl = std::clamp(resolutionControl, 0, 1);
+        processingMode = std::clamp(processingMode, 0, 1);
+        updateInterval = std::clamp(updateInterval, 2, 4);
+        residualTransfer = std::clamp(residualTransfer, 0, 1);
+        if (!std::isfinite(targetFps) || targetFps <= 0) targetFps = 60;
         view = std::clamp(view, 0, 3); debug = std::clamp(debug, 0, 7);
         percent = std::clamp(percent, 25, 100); flow = std::clamp(flow, 0, 2);
         amdQuality = std::clamp(amdQuality, 0, 1); nvQuality = std::clamp(nvQuality, 1, 5);
@@ -41,18 +51,24 @@ struct Settings {
         }
         finiteClamp(mix, 1, 1); finiteClamp(strength, 1); finiteClamp(chroma, 1);
         finiteClamp(lightness, 1); finiteClamp(darken, 1); finiteClamp(brighten, 1);
+        finiteClamp(midtone, 1); finiteClamp(chromaProtection, 0, 1);
         finiteClamp(hue, 0, 1); finiteClamp(darkProtect, 0, 1);
         finiteClamp(brightProtect, 0, 1); finiteClamp(compression, 0, 1);
         finiteClamp(low, 1); finiteClamp(high, 1); finiteClamp(afStrength, 1, 1);
         responseMs = std::isfinite(responseMs) ? std::clamp(responseMs, 10.f, 500.f) : 80.f;
     }
     bool bypass() const noexcept { return view == 1 || (view == 0 && (mix == 0 || strength == 0)); }
-    auto resourceKey() const { return std::tie(scaling, percent, flow, amdQuality, nvQuality, runtime); }
+    bool adaptiveResolution() const noexcept { return scaling && resolutionControl == 0; }
+    auto resourceKey() const {
+        return std::tie(modelPreset, scaling, resolutionControl, percent, processingMode, updateInterval,
+                        residualTransfer, flow, amdQuality, nvQuality, runtime);
+    }
     auto outletKey() const {
-        return std::tie(mix, strength, chroma, lightness, darken, brighten, hue, darkProtect,
+        return std::tie(mix, strength, chroma, lightness, darken, brighten, midtone, chromaProtection, hue, darkProtect,
                         brightProtect, compression, low, high, view, debug, af, afStrength, responseMs);
     }
     int firstDirty(const Settings& previous) const noexcept {
+        if (modelPreset != previous.modelPreset) return 0;
         int first = std::min(passes, previous.passes);
         for (int i = 0; i < first; ++i) if (pass[i] != previous.pass[i]) return i;
         return first;
@@ -63,7 +79,7 @@ struct Extent {
     bool operator==(const Extent&) const = default;
 };
 inline Extent inferenceExtent(Extent source, const Settings& settings) noexcept {
-    const auto percent = settings.scaling ? static_cast<unsigned>(settings.percent) : 100u;
+    const auto percent = settings.scaling && !settings.adaptiveResolution() ? static_cast<unsigned>(settings.percent) : 100u;
     return {static_cast<unsigned>(static_cast<std::uint64_t>(source.width) * percent / 100),
             static_cast<unsigned>(static_cast<std::uint64_t>(source.height) * percent / 100)};
 }

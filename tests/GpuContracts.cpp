@@ -71,10 +71,15 @@ int main(int argc,char** argv) {
         hr(device->CreateTexture2D(&desc,&upload,&input),"Create GPU test input");
         hr(device->CreateTexture2D(&desc,nullptr,&output),"Create GPU test output");
         Settings settings; if (real && argc>4) settings.runtime=argv[4];
+        if (benchmark && argc>8) settings.modelPreset=std::stoi(argv[8]);
+        else if (!benchmark && real && argc>5) settings.modelPreset=std::stoi(argv[5]);
         if (benchmark && argc>7) {
             settings.percent=std::stoi(argv[7]); settings.scaling=settings.percent!=100;
         }
-        GpuBackend backend(real ? BackendTestMode::Neural : BackendTestMode::Identity,benchmark ? 3 : 3000);
+        // This is an offline/readback probe. Its allocator budget must not
+        // borrow the production CompletedFrames render-path budget of 3 ms.
+        constexpr unsigned offlineWaitBudgetMs=3000;
+        GpuBackend backend(real ? BackendTestMode::Neural : BackendTestMode::Identity,offlineWaitBudgetMs);
         FrameKey key{1,0,1,extent}; std::uint64_t now=1000000000;
         check(backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,true),backend.diagnostics().error.c_str());
         auto result=read(device.Get(),context.Get(),output.Get());
@@ -125,25 +130,54 @@ int main(int argc,char** argv) {
             return 0;
         }
         if (benchmark) {
-            timeBeginPeriod(1);
+            struct TimerResolution {
+                TimerResolution() { timeBeginPeriod(1); }
+                ~TimerResolution() { timeEndPeriod(1); }
+            } timerResolution;
             const int fps=argc>5 ? std::stoi(argv[5]) : 60;
             const int frames=argc>6 ? std::stoi(argv[6]) : 300;
             const int percent=argc>7 ? std::stoi(argv[7]) : 100;
+            check(fps>0 && frames>0,"Benchmark FPS and frame count must be positive");
             settings.scaling=percent!=100; settings.percent=percent;
-            std::vector<double> gpu,cpu,wait;
+            constexpr int warmupFrames=11;
+            std::vector<double> gpu,prepare,nr,post,temporal,cpu,wait,processWall;
+            std::uint64_t attempted=0,accepted=0,busyCalls=0,lateStarts=0,overBudgetCalls=0;
+            auto previousCompleted=backend.diagnostics().completedFrames;
+            bool failed=false;
+            const double frameBudgetMs=1000./fps;
             const auto start=std::chrono::steady_clock::now();
             for (int frame=0;frame<frames;++frame) {
                 const auto due=start+std::chrono::nanoseconds(static_cast<long long>(frame)*1000000000ll/fps);
                 std::this_thread::sleep_until(due);
                 key.cycle++;
-                now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-                if (!backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,false))
-                    throw std::runtime_error(backend.diagnostics().report());
+                const auto processStart=std::chrono::steady_clock::now();
+                if (std::chrono::duration<double,std::milli>(processStart-due).count()>frameBudgetMs) ++lateStarts;
+                now=std::chrono::duration_cast<std::chrono::nanoseconds>(processStart.time_since_epoch()).count();
+                const bool processed=backend.process(device.Get(),input.Get(),output.Get(),settings,key,now,false);
+                const double wallMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-processStart).count();
+                ++attempted; if (wallMs>frameBudgetMs) ++overBudgetCalls;
                 const auto diagnostics=backend.diagnostics();
-                if (frame>10) { gpu.push_back(diagnostics.gpuTotalMs); cpu.push_back(diagnostics.cpuSubmitMs); wait.push_back(diagnostics.waitMs); }
+                if (processed) ++accepted;
+                else if (diagnostics.state=="busy") ++busyCalls;
+                else { std::cerr << diagnostics.report() << '\n'; failed=true; }
+                if (frame>=warmupFrames) {
+                    processWall.push_back(wallMs);
+                    if (processed) { cpu.push_back(diagnostics.cpuSubmitMs); wait.push_back(diagnostics.waitMs); }
+                    // GPU timing belongs to the most recently completed job.
+                    // Do not multiply a stale sample when a call reports Busy.
+                    if (diagnostics.completedFrames!=previousCompleted && diagnostics.gpuTotalMs>0) {
+                        gpu.push_back(diagnostics.gpuTotalMs); prepare.push_back(diagnostics.gpuPrepareMs);
+                        nr.push_back(diagnostics.gpuNrMs); post.push_back(diagnostics.gpuPostMs);
+                        temporal.push_back(diagnostics.gpuTemporalMs);
+                    }
+                }
+                previousCompleted=diagnostics.completedFrames;
+                if (failed) break;
             }
-            read(device.Get(),context.Get(),output.Get());
+            if (accepted) read(device.Get(),context.Get(),output.Get());
+            const auto seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
             auto percentile=[](std::vector<double> values,double p) {
+                if (values.empty()) return 0.;
                 std::sort(values.begin(),values.end());
                 return values.at(static_cast<size_t>(p*(values.size()-1)));
             };
@@ -151,9 +185,18 @@ int main(int argc,char** argv) {
                       << "; frames=" << frames << "; percent=" << percent
                       << "; gpuP95=" << percentile(gpu,.95) << "; gpuP99=" << percentile(gpu,.99)
                       << "; cpuP95=" << percentile(cpu,.95) << "; allocatorWaitP95=" << percentile(wait,.95)
-                      << "\nOBS composition, game and NVENC are not included.\n";
-            timeEndPeriod(1);
-            return 0;
+                      << "; processWallP50=" << percentile(processWall,.50) << "; processWallP95=" << percentile(processWall,.95)
+                      << "; processWallP99=" << percentile(processWall,.99)
+                      << "; gpuPrepareP95=" << percentile(prepare,.95) << "; gpuNrP95=" << percentile(nr,.95)
+                      << "; gpuPostP95=" << percentile(post,.95) << "; gpuTemporalP95=" << percentile(temporal,.95)
+                      << "; attemptedFrames=" << attempted << "; acceptedFrames=" << accepted << "; busyCalls=" << busyCalls
+                      << "; lateStarts=" << lateStarts << "; overBudgetCalls=" << overBudgetCalls
+                      << "; gpuSamples=" << gpu.size() << "; warmupFrames=" << warmupFrames
+                      << "; offlineWaitBudgetMs=" << offlineWaitBudgetMs << "; wallSeconds=" << seconds
+                      << "; effectiveSubmitFps=" << (seconds>0 ? accepted/seconds : 0)
+                      << "\nOBS composition, game and NVENC work are not timed; concurrent GPU load still affects this probe.\n";
+            if (gpu.empty()) std::cerr << "No completed GPU timing samples after benchmark warmup\n";
+            return failed || gpu.empty() ? 1 : 0;
         }
         if (!real) check(result==pixels,"Identity backend altered original RGB or alpha");
         for (size_t i=0;i<pixels.size();i+=4) {

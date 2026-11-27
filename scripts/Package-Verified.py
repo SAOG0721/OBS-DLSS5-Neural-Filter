@@ -47,8 +47,8 @@ def assert_zip(path, forbidden):
 def main():
     project = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--candidate', type=Path, default=Path('dist/0.1.0'))
-    parser.add_argument('--output-stem', default='DLSS5-Neural-Filter-0.1.0')
+    parser.add_argument('--candidate', type=Path, default=Path('dist/0.2.2'))
+    parser.add_argument('--output-stem', default='DLSS5-Neural-Filter-0.2.2')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', args.output_stem):
         parser.error('Output stem must be a single file name')
@@ -83,6 +83,33 @@ def main():
         if file.is_file() and digest(file) != digest(payload / 'data' / file.relative_to(project / 'data')):
             raise SystemExit(f'Candidate resource differs from source: {file.name}')
 
+    # The public ZIP mirrors the OBS installation root. Keep staging metadata
+    # outside it so installation is just merging these two directories.
+    archive_files = []
+    for file in sorted(actual):
+        relative = file.relative_to(payload).as_posix()
+        if relative.startswith('bin/64bit/'):
+            destination = 'obs-plugins/64bit/' + relative.removeprefix('bin/64bit/')
+        elif relative.startswith('data/'):
+            destination = 'data/obs-plugins/obs-dlss5/' + relative.removeprefix('data/')
+        else:
+            raise SystemExit(f'Unexpected production payload path: {relative}')
+        archive_files.append((file, destination))
+    guide = candidate / '安装说明.txt'
+    if guide.read_bytes() != (project / 'docs/DISTRIBUTION-INSTALL.md').read_bytes():
+        raise SystemExit('Candidate installation guide differs from source')
+    archive_files.append((guide, guide.name))
+    installer_sources = {
+        'Install.cmd': project / 'scripts/Install.cmd',
+        'Uninstall.cmd': project / 'scripts/Uninstall.cmd',
+        'installer/Manage-Install.ps1': project / 'scripts/Manage-Install.ps1',
+    }
+    for rel, src_path in installer_sources.items():
+        staged_installer = candidate / rel
+        if not staged_installer.is_file() or staged_installer.read_bytes() != src_path.read_bytes():
+            raise SystemExit(f'Candidate installer file differs from source or is missing: {rel}')
+        archive_files.append((staged_installer, rel))
+
     source_zip = project / 'dist' / (args.output_stem + '-source.zip')
     sources = source_files(project)
     source_manifest = {
@@ -93,13 +120,24 @@ def main():
     }
     if (project / '.git').exists():
         source_commit = subprocess.check_output(['git', '-C', str(project), 'rev-parse', 'HEAD'], text=True).strip()
+        source_matches_commit = True
         for file in sources:
             relative = file.relative_to(project).as_posix()
-            committed = subprocess.check_output(['git', '-C', str(project), 'show', f'HEAD:{relative}'])
-            if hashlib.sha256(committed).hexdigest().upper() != digest(file):
-                raise SystemExit(f'Source differs from the selected commit: {relative}')
-        source_manifest['SourceCommit'] = source_commit
-        manifest['SourceCommit'] = source_commit
+            committed = subprocess.run(['git', '-C', str(project), 'show', f'HEAD:{relative}'],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            if committed.returncode or hashlib.sha256(committed.stdout).hexdigest().upper() != digest(file):
+                source_matches_commit = False
+                break
+        if source_matches_commit:
+            source_manifest['SourceCommit'] = source_commit
+            manifest['SourceCommit'] = source_commit
+        else:
+            # The archive above pairs the actual current source files with the
+            # verified current DLL; do not label a working tree as a clean commit.
+            source_manifest['SourceBaseCommit'] = source_commit
+            source_manifest['SourceTreeState'] = 'working-tree'
+            manifest['SourceBaseCommit'] = source_commit
+            manifest['SourceTreeState'] = 'working-tree'
     with zipfile.ZipFile(source_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for file in sources:
             archive.write(file, 'obs/' + file.relative_to(project).as_posix())
@@ -108,16 +146,27 @@ def main():
     manifest['SourceArchive'] = {'Name': source_zip.name, **record(source_zip)}
     manifest['PackageFiles'] = [{'Relative': file.relative_to(candidate).as_posix(), 'SHA256': digest(file)}
                                for file in sorted(candidate.rglob('*')) if file.is_file() and file != manifest_path]
+    manifest['ArchiveFiles'] = [{'Relative': destination, 'SHA256': digest(file)}
+                                for file, destination in archive_files]
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
     binary_zip = project / 'dist' / (args.output_stem + '-Windows-x64.zip')
     with zipfile.ZipFile(binary_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for file in sorted(candidate.rglob('*')):
-            if file.is_file():
-                archive.write(file, file.relative_to(candidate).as_posix())
-    assert_zip(binary_zip, lambda name: 'identity' in name.lower() or name.lower().endswith(('.exe', '.pdb', '.lib', '.exp')) or '/config/' in name or '/logs/' in name)
+        for file, destination in archive_files:
+            archive.write(file, destination)
+    allowed_installer_scripts = {'Install.cmd', 'Uninstall.cmd', 'installer/Manage-Install.ps1'}
+    assert_zip(
+        binary_zip,
+        lambda name: 'identity' in name.lower()
+        or name.lower().endswith(('.exe', '.pdb', '.lib', '.exp'))
+        or (name.lower().endswith(('.ps1', '.cmd')) and name not in allowed_installer_scripts)
+        or '/config/' in name
+        or '/logs/' in name,
+    )
     with zipfile.ZipFile(binary_zip) as archive:
-        for entry in manifest['PackageFiles']:
+        if set(archive.namelist()) != {entry['Relative'] for entry in manifest['ArchiveFiles']}:
+            raise SystemExit('Archived package file set differs from the OBS directory layout')
+        for entry in manifest['ArchiveFiles']:
             actual_hash = hashlib.sha256(archive.read(entry['Relative'])).hexdigest().upper()
             if actual_hash != entry['SHA256']:
                 raise SystemExit(f'Archived package file differs: {entry["Relative"]}')

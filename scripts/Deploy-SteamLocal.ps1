@@ -6,7 +6,7 @@ param(
     [string]$BackupRoot=(Join-Path $env:LOCALAPPDATA 'Dlss5NeuralFilter\Backups'),
     [switch]$Apply
 )
-if (!$PackageRoot) { $PackageRoot=Join-Path $PSScriptRoot '..\dist\0.1.0-dev' }
+if (!$PackageRoot) { $PackageRoot=Join-Path $PSScriptRoot '..\dist\0.2.2' }
 . (Join-Path $PSScriptRoot 'Delivery.ps1')
 $target=Resolve-NeuralPath $ObsRoot
 $package=Resolve-NeuralPath $PackageRoot
@@ -36,7 +36,7 @@ Assert-NeuralRuntime (Join-Path $source 'bin\64bit\runtime\nvngx_dlssnr.dll')
 $plan=[ordered]@{Mode='Preview';Plugin='DLSS5 Neural Filter';Layout='Steam application-local';
     Destination=$target;OBSVersionGate=$false;Files=@($files | Select-Object Relative,SHA256)}
 if (!$Apply) { $plan | ConvertTo-Json -Depth 5; return }
-if (Get-Process obs64 -ErrorAction SilentlyContinue) { throw 'Close OBS before deploying plugin files' }
+if (Test-NeuralObsRunningForTarget $target) { throw 'Close OBS before deploying plugin files' }
 $id='Steam-'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8)
 $backup=Join-Path $backupBase $id
 New-Item -ItemType Directory -Path $backup -Force | Out-Null

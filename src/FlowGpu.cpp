@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <vector>
 #include <cstdio>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <thread>
 
 namespace neural {
 using Microsoft::WRL::ComPtr;
@@ -53,15 +57,29 @@ struct FlowGpu::Impl {
     NV_OF_D3D11_API_FUNCTION_LIST api{};
     ComPtr<ID3D11Device5> device11;
     ComPtr<ID3D11DeviceContext4> context11;
-    ComPtr<ID3D11Fence> completed11,ready11;
-    ID3D12Fence* registeredReady=nullptr;
+    ComPtr<ID3D11Fence> completed11;
     NvOFHandle handle=nullptr;
     ComPtr<ID3D12Fence> completed;
     std::uint64_t fenceValue=0;
     std::array<NvOFGPUBufferHandle,3> registration{};
     std::array<ID3D12Resource*,3> registeredResources{};
     std::array<ComPtr<ID3D11Texture2D>,3> shared11;
+    struct Job {
+        ComPtr<ID3D12Fence> ready;
+        std::uint64_t readyValue=0,completedValue=0;
+        bool reset=false;
+    };
+    mutable std::mutex workerMutex;
+    std::condition_variable workerWake;
+    std::optional<Job> job;
+    std::string workerError;
+    HANDLE readyEvent=nullptr;
+    std::jthread worker;
     ~Impl() {
+        if (worker.joinable()) {
+            worker.request_stop(); workerWake.notify_one(); worker.join();
+        }
+        if (readyEvent) CloseHandle(readyEvent);
         if (amd) ffxOpticalflowContextDestroy(&context);
         if (handle) {
             trace("destructor NVOF enter");
@@ -94,6 +112,44 @@ struct FlowGpu::Impl {
         nv(api.nvOFRegisterResourceD3D11(handle,shared11[index].Get(),&registration[index]),"Register NVOF D3D11 texture");
         trace("registerResource complete");
         registeredResources[index]=resource;
+    }
+    void run(std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            Job next;
+            {
+                std::unique_lock lock(workerMutex);
+                workerWake.wait(lock,[&] { return stop.stop_requested() || job.has_value(); });
+                if (stop.stop_requested()) return;
+                next=std::move(*job); job.reset();
+            }
+            try {
+                // NvOFExecute uses its own driver engine. A queued D3D11 Wait
+                // did not order reads of externally-produced shared R8 inputs.
+                // Resolve that producer fence on this private worker, keeping
+                // the OBS/render submit path nonblocking.
+                for (;;) {
+                    const auto value=next.ready->GetCompletedValue();
+                    if (value==UINT64_MAX) throw std::runtime_error("NVOF producer device was removed");
+                    if (value>=next.readyValue) break;
+                    if (stop.stop_requested()) return;
+                    hr(next.ready->SetEventOnCompletion(next.readyValue,readyEvent),"Arm NVOF input completion");
+                    const auto result=WaitForSingleObject(readyEvent,50);
+                    if (result!=WAIT_OBJECT_0 && result!=WAIT_TIMEOUT) throw std::runtime_error("Wait for NVOF input failed");
+                }
+                NV_OF_EXECUTE_INPUT_PARAMS in{};
+                in.inputFrame=registration[0]; in.referenceFrame=registration[1];
+                in.disableTemporalHints=next.reset ? NV_OF_TRUE : NV_OF_FALSE;
+                NV_OF_EXECUTE_OUTPUT_PARAMS out{}; out.outputBuffer=registration[2];
+                nv(api.nvOFExecute(handle,&in,&out),"Dispatch NVOF D3D11");
+                hr(context11->Signal(completed11.Get(),next.completedValue),"Signal NVOF completion");
+                context11->Flush();
+            } catch (const std::exception& e) {
+                { std::scoped_lock lock(workerMutex); workerError=e.what(); }
+                // Release queued GPU consumers so the backend can surface the
+                // failure before publication instead of retaining a dead wait.
+                completed->Signal(next.completedValue);
+            }
+        }
     }
 };
 FlowGpu::FlowGpu() : impl_(std::make_unique<Impl>()) {}
@@ -178,6 +234,9 @@ void FlowGpu::initialize(ID3D12Device* device,ID3D11Device* obsDevice,Extent inf
         const auto result=p.device11->OpenSharedFence(shared,IID_PPV_ARGS(&p.completed11));
         CloseHandle(shared); hr(result,"Open NVOF completion fence");
         p.registerResource(2,p.motion.Get());
+        p.readyEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        if (!p.readyEvent) throw std::runtime_error("Create NVOF input event failed");
+        p.worker=std::jthread([state=next.get()](std::stop_token stop) { state->run(stop); });
     }
     impl_=std::move(next);
 }
@@ -200,27 +259,24 @@ void FlowGpu::recordAmd(ID3D12GraphicsCommandList* list,ID3D12Resource* color,bo
     }
     p.needsReference=false;
 }
+void FlowGpu::prepareNvInputs(ID3D12Resource* current,ID3D12Resource* previous,
+                              ID3D11Texture2D* current11,ID3D11Texture2D* previous11) {
+    auto& p=*impl_; if (p.selected!=2) return;
+    p.registerResource(0,current,current11); p.registerResource(1,previous,previous11);
+}
 void FlowGpu::submitNv(ID3D12Resource* current,ID3D12Resource* previous,
                        ID3D11Texture2D* current11,ID3D11Texture2D* previous11,
                        ID3D12Fence* ready,std::uint64_t readyValue,bool reset) {
     auto& p=*impl_; if (p.selected != 2) return;
     trace("submitNv enter");
-    p.registerResource(0,current,current11); p.registerResource(1,previous,previous11);
-    if (p.registeredReady!=ready) {
-        HANDLE shared=nullptr;
-        hr(p.device->CreateSharedHandle(ready,nullptr,GENERIC_ALL,nullptr,&shared),"Share NVOF input fence");
-        const auto result=p.device11->OpenSharedFence(shared,IID_PPV_ARGS(&p.ready11));
-        CloseHandle(shared); hr(result,"Open NVOF input fence");
-        p.registeredReady=ready;
+    check();
+    prepareNvInputs(current,previous,current11,previous11);
+    {
+        std::scoped_lock lock(p.workerMutex);
+        if (p.job) throw std::runtime_error("NVOF submission already queued");
+        p.job=Impl::Job{ready,readyValue,++p.fenceValue,reset || p.needsReference};
     }
-    hr(p.context11->Wait(p.ready11.Get(),readyValue),"NVOF wait for GPU grayscale conversion");
-    NV_OF_EXECUTE_INPUT_PARAMS in{};
-    in.inputFrame=p.registration[0]; in.referenceFrame=p.registration[1];
-    in.disableTemporalHints=(reset || p.needsReference) ? NV_OF_TRUE : NV_OF_FALSE;
-    NV_OF_EXECUTE_OUTPUT_PARAMS out{}; out.outputBuffer=p.registration[2];
-    nv(p.api.nvOFExecute(p.handle,&in,&out),"Dispatch NVOF D3D11");
-    hr(p.context11->Signal(p.completed11.Get(),++p.fenceValue),"Signal NVOF completion");
-    p.context11->Flush();
+    p.workerWake.notify_one();
     p.needsReference=false;
     trace("submitNv complete");
 }
@@ -234,6 +290,10 @@ int FlowGpu::grid() const noexcept { return impl_->grid; }
 float FlowGpu::divisor() const noexcept { return impl_->selected == 2 ? 32.f : 1.f; }
 int FlowGpu::method() const noexcept { return impl_->selected; }
 bool FlowGpu::readyForMotion() const noexcept { return impl_->selected==2 || !impl_->needsReference; }
+void FlowGpu::check() const {
+    std::scoped_lock lock(impl_->workerMutex);
+    if (!impl_->workerError.empty()) throw std::runtime_error(impl_->workerError);
+}
 std::string FlowGpu::description() const {
     const auto& p=*impl_;
     if (!p.selected) return "none";
